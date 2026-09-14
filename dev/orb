@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly GITHUB_REMOTE="origin"
+readonly AMP_REMOTE="orb"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dev/orb setup <github-url> [amp-project]
+  dev/orb doctor
+  dev/orb configure-test <command>
+  dev/orb start <prompt>
+  dev/orb sync [thread-url-or-id]
+  dev/orb publish [-m <commit-message>]
+
+The workflow keeps GitHub on the local `origin` remote and uses the Amp-hosted
+`orb` remote only as a clean source snapshot for remote development.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+repository_root() {
+  git rev-parse --show-toplevel 2>/dev/null || die "run this command inside a Git repository"
+}
+
+remote_url() {
+  git config --get "remote.$1.url" 2>/dev/null || return 1
+}
+
+is_github_url() {
+  case "$1" in
+    https://github.com/*|git@github.com:*|ssh://git@github.com/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_remote_topology() {
+  local github_url amp_url
+
+  github_url="$(remote_url "$GITHUB_REMOTE")" || die "missing GitHub remote '$GITHUB_REMOTE'; run 'dev/orb setup'"
+  amp_url="$(remote_url "$AMP_REMOTE")" || die "missing Amp mirror remote '$AMP_REMOTE'; run 'dev/orb setup'"
+
+  is_github_url "$github_url" || die "'$GITHUB_REMOTE' must point to GitHub, but points to: $github_url"
+  [[ "$amp_url" == https://ampcode.com/* ]] ||
+    die "'$AMP_REMOTE' must point to an Amp-hosted repository, but points to: $amp_url"
+}
+
+require_clean_checkout() {
+  [[ -z "$(git status --porcelain)" ]] ||
+    die "the working tree must be clean; commit, stash, or discard local changes first"
+}
+
+base_branch() {
+  git config --get orbWorkflow.baseBranch 2>/dev/null || printf 'main\n'
+}
+
+state_directory() {
+  git rev-parse --git-path amp-orb-workflow
+}
+
+normalize_thread_id() {
+  local value="$1"
+  value="${value##*/}"
+  value="${value%%\?*}"
+  value="${value%%#*}"
+  [[ "$value" == T-* ]] || die "invalid Amp thread URL or ID: $1"
+  printf '%s\n' "$value"
+}
+
+setup_workflow() {
+  local github_url="${1:-}" project="${2:-}" current_origin
+
+  [[ -n "$github_url" ]] || die "setup requires the GitHub repository URL"
+  is_github_url "$github_url" || die "not a GitHub repository URL: $github_url"
+
+  if remote_url "$AMP_REMOTE" >/dev/null; then
+    [[ "$(remote_url "$AMP_REMOTE")" == https://ampcode.com/* ]] ||
+      die "remote '$AMP_REMOTE' already exists and is not Amp-hosted"
+  else
+    current_origin="$(remote_url "$GITHUB_REMOTE")" || die "expected the cloned Amp repository to have an 'origin' remote"
+    [[ "$current_origin" == https://ampcode.com/* ]] ||
+      die "cannot find the Amp-hosted repository; expected 'origin' to point to ampcode.com"
+    git remote rename "$GITHUB_REMOTE" "$AMP_REMOTE"
+  fi
+
+  if remote_url "$GITHUB_REMOTE" >/dev/null; then
+    [[ "$(remote_url "$GITHUB_REMOTE")" == "$github_url" ]] ||
+      die "remote '$GITHUB_REMOTE' already points somewhere else: $(remote_url "$GITHUB_REMOTE")"
+  else
+    git remote add "$GITHUB_REMOTE" "$github_url"
+  fi
+
+  git config --local orbWorkflow.baseBranch main
+  if [[ -n "$project" ]]; then
+    git config --local orbWorkflow.project "$project"
+  else
+    git config --local orbWorkflow.project "$(remote_url "$AMP_REMOTE")"
+  fi
+
+  printf 'Configured local workflow:\n'
+  printf '  GitHub authority: %s -> %s\n' "$GITHUB_REMOTE" "$(remote_url "$GITHUB_REMOTE")"
+  printf '  Amp orb mirror:   %s -> %s\n' "$AMP_REMOTE" "$(remote_url "$AMP_REMOTE")"
+  printf '\nPush the initial branch locally with: git push -u origin main\n'
+}
+
+doctor() {
+  local test_command
+
+  require_command git
+  require_command amp
+  require_remote_topology
+
+  printf 'GitHub authority: %s\n' "$(remote_url "$GITHUB_REMOTE")"
+  printf 'Amp orb mirror:   %s\n' "$(remote_url "$AMP_REMOTE")"
+  printf 'Amp project:      %s\n' "$(git config --get orbWorkflow.project 2>/dev/null || remote_url "$AMP_REMOTE")"
+  printf 'Base branch:      %s\n' "$(base_branch)"
+
+  test_command="$(git config --get orbWorkflow.testCommand 2>/dev/null || true)"
+  if [[ -n "$test_command" ]]; then
+    printf 'Test command:     %s\n' "$test_command"
+  else
+    printf 'Test command:     not configured (publish will run Git integrity checks only)\n'
+  fi
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    printf 'Working tree:     dirty\n'
+  else
+    printf 'Working tree:     clean\n'
+  fi
+}
+
+configure_test() {
+  [[ $# -gt 0 ]] || die "configure-test requires a command, for example: dev/orb configure-test 'pnpm test'"
+  git config --local orbWorkflow.testCommand "$*"
+  printf 'Configured publish test command: %s\n' "$*"
+}
+
+start_task() {
+  local prompt="$*" base head upstream project output_file thread_url thread_id state_dir
+
+  [[ -n "$prompt" ]] || die "start requires a development prompt"
+  require_command amp
+  require_remote_topology
+  require_clean_checkout
+
+  base="$(base_branch)"
+  git fetch "$GITHUB_REMOTE" "$base"
+  upstream="$(git rev-parse "$GITHUB_REMOTE/$base" 2>/dev/null)" ||
+    die "GitHub has no '$base' branch; push it locally before starting an orb"
+  head="$(git rev-parse HEAD)"
+  [[ "$head" == "$upstream" ]] ||
+    die "HEAD must exactly match $GITHUB_REMOTE/$base before handoff; publish or update your local checkout first"
+
+  # A normal, non-forced push makes divergence in the mirror visible rather than
+  # silently overwriting work that may still exist there.
+  git push "$AMP_REMOTE" "HEAD:refs/heads/$base"
+
+  project="$(git config --get orbWorkflow.project 2>/dev/null || remote_url "$AMP_REMOTE")"
+  output_file="$(mktemp)"
+  trap 'rm -f "$output_file"' EXIT
+
+  amp -ox "$prompt
+
+This task was delegated from a local checkout. Do not access GitHub and do not push any Git remote. Complete and verify the work in the orb, then leave all changes available for amp sync." \
+    --project "$project" | tee "$output_file"
+
+  thread_url="$(grep -Eo 'https://ampcode\.com/threads/T-[[:alnum:]-]+' "$output_file" | tail -n 1 || true)"
+  [[ -n "$thread_url" ]] || die "the orb was started, but its thread URL could not be read from Amp output"
+  thread_id="$(normalize_thread_id "$thread_url")"
+  state_dir="$(state_directory)"
+  mkdir -p "$state_dir"
+  printf '%s\n' "$head" >"$state_dir/$thread_id.base"
+  printf '%s\n' "$(git branch --show-current)" >"$state_dir/$thread_id.branch"
+  printf '%s\n' "$thread_id" >"$state_dir/last-thread"
+  rm -f "$output_file"
+  trap - EXIT
+
+  printf '\nStarted %s from %s. Sync it later with:\n  dev/orb sync %s\n' "$thread_url" "$head" "$thread_id"
+}
+
+sync_task() {
+  local supplied="${1:-}" thread_id state_dir expected_head current_head
+
+  require_command amp
+  require_clean_checkout
+  state_dir="$(state_directory)"
+
+  if [[ -n "$supplied" ]]; then
+    thread_id="$(normalize_thread_id "$supplied")"
+  else
+    [[ -f "$state_dir/last-thread" ]] || die "no recorded thread; pass a thread URL or ID"
+    thread_id="$(cat "$state_dir/last-thread")"
+  fi
+
+  [[ -f "$state_dir/$thread_id.base" ]] ||
+    die "thread $thread_id was not started from this worktree; sync from its original worktree"
+  expected_head="$(cat "$state_dir/$thread_id.base")"
+  current_head="$(git rev-parse HEAD)"
+  [[ "$current_head" == "$expected_head" ]] ||
+    die "this checkout moved after handoff; expected $expected_head but found $current_head"
+
+  amp sync "$thread_id"
+  git diff --check
+  git diff --cached --check
+  printf '\nSynced %s. Review these changes before publishing:\n' "$thread_id"
+  git status --short --branch
+}
+
+publish_task() {
+  local message="" base branch test_command
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m)
+        shift
+        [[ $# -gt 0 ]] || die "-m requires a commit message"
+        message="$1"
+        ;;
+      *) die "unknown publish option: $1" ;;
+    esac
+    shift
+  done
+
+  require_remote_topology
+  base="$(base_branch)"
+  branch="$(git branch --show-current)"
+  [[ -n "$branch" ]] || die "cannot publish a detached HEAD"
+
+  git fetch "$GITHUB_REMOTE" "$base"
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    [[ -n "$message" ]] || die "uncommitted changes require: dev/orb publish -m '<commit message>'"
+    git add -A
+    git commit -m "$message"
+  elif [[ -n "$message" ]]; then
+    die "-m was supplied, but there are no uncommitted changes"
+  fi
+
+  git rebase "$GITHUB_REMOTE/$base"
+  git diff --check "$GITHUB_REMOTE/$base...HEAD"
+
+  test_command="$(git config --get orbWorkflow.testCommand 2>/dev/null || true)"
+  if [[ -n "$test_command" ]]; then
+    printf 'Running configured test command: %s\n' "$test_command"
+    bash -lc "$test_command"
+  else
+    printf 'No project test command is configured; Git integrity checks passed.\n'
+  fi
+
+  git push -u "$GITHUB_REMOTE" "HEAD:refs/heads/$branch"
+  if [[ "$branch" == "$base" ]]; then
+    git push "$AMP_REMOTE" "HEAD:refs/heads/$base"
+  else
+    printf 'Published feature branch %s. The Amp mirror will update after it is merged into %s.\n' "$branch" "$base"
+  fi
+}
+
+main() {
+  local root command="${1:-}"
+
+  require_command git
+  root="$(repository_root)"
+  cd "$root"
+
+  case "$command" in
+    setup) shift; setup_workflow "$@" ;;
+    doctor) shift; [[ $# -eq 0 ]] || die "doctor takes no arguments"; doctor ;;
+    configure-test) shift; configure_test "$@" ;;
+    start) shift; start_task "$@" ;;
+    sync) shift; [[ $# -le 1 ]] || die "sync accepts at most one thread"; sync_task "$@" ;;
+    publish) shift; publish_task "$@" ;;
+    help|-h|--help|'') usage ;;
+    *) usage >&2; die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

@@ -6,6 +6,9 @@ The application will create household dinner plans, collect feedback through cha
 
 See [the MVP product specification](docs/product-spec.md) for the agreed scope and product decisions.
 
+Development can be delegated to Amp orbs without giving them GitHub credentials. See the
+[local-to-orb development workflow](docs/orb-workflow.md).
+
 ## Status
 
 Product definition. Implementation has not started.
