@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# No services or authenticated sessions currently need repair after an orb
+# wakes. Keep this hook fast and add only reconnect or repair work here.
+printf '[orb resume] No resume-time actions are currently required.\n'

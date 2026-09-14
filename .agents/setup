@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+started_at=$SECONDS
+
+printf '[orb setup] Checking repository prerequisites...\n'
+
+for command_name in bash git; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf '[orb setup] Missing required command: %s\n' "$command_name" >&2
+    exit 1
+  fi
+done
+
+# The repository currently contains documentation and Bash tooling only. Keep
+# this lifecycle entry point so the application toolchain can be installed here
+# as soon as its version pins and lockfiles are added.
+bash -n dev/orb
+
+printf '[orb setup] Ready in %ss; no external dependencies are currently required.\n' "$((SECONDS - started_at))"
