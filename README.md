@@ -12,3 +12,18 @@ Development can be delegated to Amp orbs without giving them GitHub credentials.
 ## Status
 
 Product definition. Implementation has not started.
+
+## Database initialization
+
+Run the application to create a SQLite database and apply the current schema:
+
+```bash
+go run ./cmd/meal-planner
+```
+
+The database defaults to `meal-planner.db` in the current directory. Set a different file path
+with the `-db` flag:
+
+```bash
+go run ./cmd/meal-planner -db /path/to/meal-planner.db
+```
