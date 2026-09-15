@@ -62,6 +62,18 @@ git merge --ff-only origin/task/<name>
 
 If fast-forward integration is impossible, stop and report the divergence rather than rebasing, resetting, force-pushing, or guessing which side should win.
 
+## Branching and pull requests
+
+Do not commit or publish directly to `main`. All work — local edits and synced orb output alike — lands on a dedicated feature/task branch cut from `origin/main`, never on `main` itself.
+
+- Create the branch first: `git switch -c <branch>` from an up-to-date `main`.
+- When syncing an orb's work, put the synced commit(s) on that task branch (e.g. `git branch <branch> <synced-sha>`), not by fast-forwarding `main`.
+- Publish with `dev/orb publish -m '<message>'` from the branch. `publish` already treats a non-`main` branch correctly: it pushes the branch to GitHub and leaves the Amp mirror's `main` untouched until merge.
+- Open a pull request for the branch with `gh pr create`, referencing the GitHub issue(s) it addresses.
+- Merge only on the user's explicit approval — same bar as publishing itself. Do not self-merge because CI or review looks clean.
+
+`main` is intended to be protected on GitHub (require a pull request before merging; no force pushes or deletions). If a required action to configure or verify that protection is denied by the local permission system, stop, explain what was attempted and why, and let the user configure it or grant the permission — do not look for a workaround.
+
 ## Publishing
 
-Only a local checkout may write to GitHub. Publishing requires the user's explicit request and must run the configured tests after rebasing onto the latest GitHub base branch. The Amp-hosted mirror may be advanced only after GitHub publication succeeds.
+Only a local checkout may write to GitHub, and only via a branch and pull request (see above) — never a direct push to `main`. Publishing requires the user's explicit request and must run the configured tests after rebasing onto the latest GitHub base branch. The Amp-hosted mirror may be advanced past `main` only after the pull request is merged.
