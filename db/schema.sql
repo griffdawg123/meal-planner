@@ -36,7 +36,46 @@ CREATE TABLE IF NOT EXISTS member (
         ON DELETE CASCADE
 );
 
--- Future household-scoped tables should reference household(id).
--- Future member preferences and auth identities should reference member(id).
+CREATE TABLE IF NOT EXISTS preference (
+    id           TEXT PRIMARY KEY
+                      CHECK (id <> ''),
+    household_id TEXT NOT NULL
+                      CHECK (household_id <> ''),
+    member_id    TEXT
+                      CHECK (member_id IS NULL OR member_id <> ''),
+    kind         TEXT NOT NULL
+                      CHECK (kind IN ('hard', 'soft')),
+    category     TEXT NOT NULL
+                      CHECK (category IN (
+                          'allergy',
+                          'dietary_restriction',
+                          'dislike',
+                          'cuisine',
+                          'budget',
+                          'cooking_time'
+                      )),
+    value        TEXT NOT NULL
+                      CHECK (value = trim(value) AND value <> ''),
+    strength     INTEGER
+                      CHECK (
+                          (kind = 'hard' AND strength IS NULL)
+                          OR (
+                              kind = 'soft'
+                              AND typeof(strength) = 'integer'
+                              AND strength BETWEEN 1 AND 5
+                          )
+                      ),
+    created_at   TEXT NOT NULL
+                      DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+
+    FOREIGN KEY (household_id)
+        REFERENCES household (id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (household_id, member_id)
+        REFERENCES member (household_id, id)
+        ON DELETE CASCADE
+);
+
+-- Future auth identities should reference member(id).
 
 COMMIT;

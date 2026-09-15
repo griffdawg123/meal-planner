@@ -52,6 +52,43 @@ func TestHouseholdMemberSchema(t *testing.T) {
 	})
 }
 
+func TestPreferenceSchema(t *testing.T) {
+	database := newTestDatabase(t)
+	insertHousehold(t, database, "household-1", "member-1")
+	insertHousehold(t, database, "household-2", "member-2")
+
+	if _, err := database.Exec(`
+		INSERT INTO preference (id, household_id, kind, category, value)
+		VALUES (?, ?, ?, ?, ?)
+	`, "preference-household", "household-1", "hard", "allergy", "peanuts"); err != nil {
+		t.Fatalf("insert household preference: %v", err)
+	}
+	if _, err := database.Exec(`
+		INSERT INTO preference (id, household_id, member_id, kind, category, value, strength)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, "preference-member", "household-1", "member-1", "soft", "cuisine", "Italian", 4); err != nil {
+		t.Fatalf("insert member preference: %v", err)
+	}
+
+	var householdKind, memberKind string
+	if err := database.QueryRow(`SELECT kind FROM preference WHERE id = ?`, "preference-household").Scan(&householdKind); err != nil {
+		t.Fatalf("read household preference kind: %v", err)
+	}
+	if err := database.QueryRow(`SELECT kind FROM preference WHERE id = ?`, "preference-member").Scan(&memberKind); err != nil {
+		t.Fatalf("read member preference kind: %v", err)
+	}
+	if householdKind != "hard" || memberKind != "soft" {
+		t.Fatalf("preference kinds: got household=%q member=%q, want household=%q member=%q", householdKind, memberKind, "hard", "soft")
+	}
+
+	if _, err := database.Exec(`
+		INSERT INTO preference (id, household_id, member_id, kind, category, value, strength)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, "preference-wrong-household", "household-1", "member-2", "soft", "dislike", "mushrooms", 3); err == nil {
+		t.Fatal("insert accepted a preference for a member belonging to another household")
+	}
+}
+
 func TestApplySchemaCanBeReapplied(t *testing.T) {
 	database := newTestDatabase(t)
 	insertHousehold(t, database, "household-1", "member-1")
