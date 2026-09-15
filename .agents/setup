@@ -3,19 +3,39 @@
 set -euo pipefail
 
 started_at=$SECONDS
+go_version=1.27.1
+go_sha256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
+go_root="$HOME/.local/share/go-$go_version"
 
 printf '[orb setup] Checking repository prerequisites...\n'
 
-for command_name in bash git; do
+for command_name in bash curl git sha256sum tar; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     printf '[orb setup] Missing required command: %s\n' "$command_name" >&2
     exit 1
   fi
 done
 
-# The repository currently contains documentation and Bash tooling only. Keep
-# this lifecycle entry point so the application toolchain can be installed here
-# as soon as its version pins and lockfiles are added.
+if [[ ! -x "$go_root/bin/go" ]]; then
+  archive=$(mktemp)
+  trap 'rm -f "$archive"' EXIT
+  printf '[orb setup] Installing Go %s...\n' "$go_version"
+  curl --fail --location --silent --show-error \
+    "https://go.dev/dl/go${go_version}.linux-amd64.tar.gz" --output "$archive"
+  printf '%s  %s\n' "$go_sha256" "$archive" | sha256sum --check --status
+  mkdir -p "$(dirname "$go_root")"
+  staging_root="${go_root}.tmp"
+  rm -rf "$staging_root"
+  mkdir -p "$staging_root"
+  tar -xzf "$archive" --strip-components=1 -C "$staging_root"
+  mv "$staging_root" "$go_root"
+fi
+
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$go_root/bin/go" "$HOME/.local/bin/go"
+ln -sfn "$go_root/bin/gofmt" "$HOME/.local/bin/gofmt"
+
 bash -n dev/orb
 
-printf '[orb setup] Ready in %ss; no external dependencies are currently required.\n' "$((SECONDS - started_at))"
+printf '[orb setup] Ready in %ss with %s.\n' \
+  "$((SECONDS - started_at))" "$("$go_root/bin/go" version)"
