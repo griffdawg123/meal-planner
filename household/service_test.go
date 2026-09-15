@@ -119,6 +119,205 @@ func TestCreateHousehold(t *testing.T) {
 	}
 }
 
+func TestAddMember(t *testing.T) {
+	t.Run("adds a trimmed member to an existing household", func(t *testing.T) {
+		database := newTestDatabase(t)
+		service := household.NewService(database)
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+
+		added, err := service.AddMember(context.Background(), created.ID, " New Member ")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		if added.ID == "" {
+			t.Error("member ID is empty")
+		}
+		if added.HouseholdID != created.ID {
+			t.Errorf("household ID: got %q, want %q", added.HouseholdID, created.ID)
+		}
+		if added.Name != "New Member" {
+			t.Errorf("member name: got %q, want %q", added.Name, "New Member")
+		}
+
+		members, err := service.ListMembers(context.Background(), created.ID)
+		if err != nil {
+			t.Fatalf("list members: %v", err)
+		}
+		listed, ok := memberWithID(members, added.ID)
+		if !ok {
+			t.Fatalf("added member %q not returned by ListMembers: %+v", added.ID, members)
+		}
+		if listed != added {
+			t.Errorf("listed member: got %+v, want %+v", listed, added)
+		}
+	})
+
+	t.Run("rejects an empty name before touching the database", func(t *testing.T) {
+		database := newTestDatabase(t)
+		service := household.NewService(database)
+		if err := database.Close(); err != nil {
+			t.Fatalf("close database: %v", err)
+		}
+
+		_, err := service.AddMember(context.Background(), "household-id", " \t ")
+		if !errors.Is(err, household.ErrInvalidInput) {
+			t.Fatalf("error: got %v, want ErrInvalidInput", err)
+		}
+	})
+
+	t.Run("reports an unknown household", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+
+		_, err := service.AddMember(context.Background(), "missing-household", "Member")
+		if !errors.Is(err, household.ErrHouseholdNotFound) {
+			t.Fatalf("error: got %v, want ErrHouseholdNotFound", err)
+		}
+		if errors.Is(err, household.ErrInternal) {
+			t.Fatalf("unknown household was classified as internal: %v", err)
+		}
+	})
+}
+
+func TestListMembers(t *testing.T) {
+	database := newTestDatabase(t)
+	service := household.NewService(database)
+	first, err := service.CreateHousehold(
+		context.Background(), "First Household", "Australia/Sydney", "First Founder",
+	)
+	if err != nil {
+		t.Fatalf("create first household: %v", err)
+	}
+	second, err := service.CreateHousehold(
+		context.Background(), "Second Household", "Australia/Sydney", "Second Founder",
+	)
+	if err != nil {
+		t.Fatalf("create second household: %v", err)
+	}
+	firstMember, err := service.AddMember(context.Background(), first.ID, "First Member")
+	if err != nil {
+		t.Fatalf("add first member: %v", err)
+	}
+	secondFirstMember, err := service.AddMember(context.Background(), first.ID, "Second First Member")
+	if err != nil {
+		t.Fatalf("add second member to first household: %v", err)
+	}
+	otherMember, err := service.AddMember(context.Background(), second.ID, "Other Member")
+	if err != nil {
+		t.Fatalf("add member to second household: %v", err)
+	}
+
+	members, err := service.ListMembers(context.Background(), first.ID)
+	if err != nil {
+		t.Fatalf("list members: %v", err)
+	}
+	want := map[string]string{
+		first.CreatorID:      "First Founder",
+		firstMember.ID:       "First Member",
+		secondFirstMember.ID: "Second First Member",
+	}
+	if len(members) != len(want) {
+		t.Fatalf("member count: got %d (%+v), want %d", len(members), members, len(want))
+	}
+	for _, member := range members {
+		if member.HouseholdID != first.ID {
+			t.Errorf("member household ID: got %q, want %q", member.HouseholdID, first.ID)
+		}
+		name, ok := want[member.ID]
+		if !ok {
+			t.Errorf("unexpected member: %+v", member)
+			continue
+		}
+		if member.Name != name {
+			t.Errorf("member %q name: got %q, want %q", member.ID, member.Name, name)
+		}
+	}
+	if _, ok := memberWithID(members, second.CreatorID); ok {
+		t.Errorf("founder from another household was listed: %q", second.CreatorID)
+	}
+	if _, ok := memberWithID(members, otherMember.ID); ok {
+		t.Errorf("member from another household was listed: %q", otherMember.ID)
+	}
+
+	missing, err := service.ListMembers(context.Background(), "missing-household")
+	if err != nil {
+		t.Fatalf("list unknown household: %v", err)
+	}
+	if missing == nil || len(missing) != 0 {
+		t.Errorf("unknown household members: got %#v, want non-nil empty slice", missing)
+	}
+}
+
+func TestRemoveMember(t *testing.T) {
+	t.Run("removes a member and reports a repeated removal", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		added, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+
+		if err := service.RemoveMember(context.Background(), created.ID, added.ID); err != nil {
+			t.Fatalf("remove member: %v", err)
+		}
+		members, err := service.ListMembers(context.Background(), created.ID)
+		if err != nil {
+			t.Fatalf("list members: %v", err)
+		}
+		if _, ok := memberWithID(members, added.ID); ok {
+			t.Errorf("removed member is still listed: %+v", members)
+		}
+
+		err = service.RemoveMember(context.Background(), created.ID, added.ID)
+		if !errors.Is(err, household.ErrMemberNotFound) {
+			t.Fatalf("second removal error: got %v, want ErrMemberNotFound", err)
+		}
+	})
+
+	t.Run("rejects removal of the founding member without deleting them", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+
+		err = service.RemoveMember(context.Background(), created.ID, created.CreatorID)
+		if !errors.Is(err, household.ErrFoundingMember) {
+			t.Fatalf("error: got %v, want ErrFoundingMember", err)
+		}
+		if errors.Is(err, household.ErrInternal) {
+			t.Fatalf("founding member removal was classified as internal: %v", err)
+		}
+		members, err := service.ListMembers(context.Background(), created.ID)
+		if err != nil {
+			t.Fatalf("list members: %v", err)
+		}
+		if _, ok := memberWithID(members, created.CreatorID); !ok {
+			t.Fatalf("founding member %q was removed: %+v", created.CreatorID, members)
+		}
+	})
+}
+
+func memberWithID(members []household.Member, id string) (household.Member, bool) {
+	for _, member := range members {
+		if member.ID == id {
+			return member, true
+		}
+	}
+	return household.Member{}, false
+}
+
 func newTestDatabase(t *testing.T) *sql.DB {
 	t.Helper()
 
