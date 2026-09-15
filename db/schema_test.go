@@ -52,6 +52,57 @@ func TestHouseholdMemberSchema(t *testing.T) {
 	})
 }
 
+func TestApplySchemaCanBeReapplied(t *testing.T) {
+	database := newTestDatabase(t)
+	insertHousehold(t, database, "household-1", "member-1")
+
+	var householdCreatedAt, memberCreatedAt string
+	if err := database.QueryRow(
+		`SELECT created_at FROM household WHERE id = ?`, "household-1",
+	).Scan(&householdCreatedAt); err != nil {
+		t.Fatalf("read household creation time: %v", err)
+	}
+	if err := database.QueryRow(
+		`SELECT created_at FROM member WHERE id = ?`, "member-1",
+	).Scan(&memberCreatedAt); err != nil {
+		t.Fatalf("read member creation time: %v", err)
+	}
+
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("reapply schema: %v", err)
+	}
+
+	var householdID, householdName, timezone, creatorID, gotHouseholdCreatedAt string
+	if err := database.QueryRow(
+		`SELECT id, name, timezone, created_by_member_id, created_at FROM household WHERE id = ?`,
+		"household-1",
+	).Scan(&householdID, &householdName, &timezone, &creatorID, &gotHouseholdCreatedAt); err != nil {
+		t.Fatalf("read household after schema reapplication: %v", err)
+	}
+	if householdID != "household-1" || householdName != "Test Household" || timezone != "Australia/Sydney" || creatorID != "member-1" || gotHouseholdCreatedAt != householdCreatedAt {
+		t.Fatalf(
+			"household changed after schema reapplication: got (%q, %q, %q, %q, %q), want (%q, %q, %q, %q, %q)",
+			householdID, householdName, timezone, creatorID, gotHouseholdCreatedAt,
+			"household-1", "Test Household", "Australia/Sydney", "member-1", householdCreatedAt,
+		)
+	}
+
+	var memberID, memberHouseholdID, memberName, gotMemberCreatedAt string
+	if err := database.QueryRow(
+		`SELECT id, household_id, name, created_at FROM member WHERE id = ?`,
+		"member-1",
+	).Scan(&memberID, &memberHouseholdID, &memberName, &gotMemberCreatedAt); err != nil {
+		t.Fatalf("read member after schema reapplication: %v", err)
+	}
+	if memberID != "member-1" || memberHouseholdID != "household-1" || memberName != "Test Member" || gotMemberCreatedAt != memberCreatedAt {
+		t.Fatalf(
+			"member changed after schema reapplication: got (%q, %q, %q, %q), want (%q, %q, %q, %q)",
+			memberID, memberHouseholdID, memberName, gotMemberCreatedAt,
+			"member-1", "household-1", "Test Member", memberCreatedAt,
+		)
+	}
+}
+
 func newTestDatabase(t *testing.T) *sql.DB {
 	t.Helper()
 

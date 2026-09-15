@@ -2,7 +2,7 @@ PRAGMA foreign_keys = ON;
 
 BEGIN;
 
-CREATE TABLE household (
+CREATE TABLE IF NOT EXISTS household (
     id                   TEXT PRIMARY KEY
                                CHECK (id <> ''),
     name                 TEXT NOT NULL
@@ -20,7 +20,7 @@ CREATE TABLE household (
         DEFERRABLE INITIALLY DEFERRED
 );
 
-CREATE TABLE member (
+CREATE TABLE IF NOT EXISTS member (
     id           TEXT PRIMARY KEY
                       CHECK (id <> ''),
     household_id TEXT NOT NULL
