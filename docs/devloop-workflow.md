@@ -126,22 +126,25 @@ repo checkout. It hands the PR diff and issue text to a synchronous, local
 respects `AGENTS.md`'s rule that an orb must never hold GitHub credentials,
 since this path never gives it any.
 
-Two things in `implement` are genuinely unverified, because `amp` wasn't
-logged in when this was written and testing it costs real credits:
+One thing in `implement` is now confirmed, one still isn't:
 
 - **Completion detection** (`orb_thread_is_done`) polls `amp threads export
-  <thread-id>` and checks for a `status`/`state`/`executionState` field
-  matching a "done" value. This is a best guess at that payload's shape, not
-  a confirmed fact. It fails closed: if it never matches within
-  `DEVLOOP_AMP_TIMEOUT_SECONDS` (default 2700s), `implement` stops and tells
-  you to run `dev/orb sync <thread-id>` yourself rather than guessing.
+  <thread-id>` and checks `meta.lastKnownAgentState.state == "idle"`.
+  Confirmed against a real, already-finished orb thread's export payload —
+  but only the *finished* value; what it reports mid-task (still generating,
+  running a tool) is still unconfirmed, since that requires catching a
+  thread while it's actually running. It still fails closed: if it never
+  reports idle within `DEVLOOP_AMP_TIMEOUT_SECONDS` (default 2700s),
+  `implement` stops and tells you to run `dev/orb sync <thread-id>` yourself
+  rather than guessing. Watch the first few real runs for it going idle too
+  early (e.g. between tool calls rather than at the true end of the task),
+  which would sync a partial change.
 - **Headless permission prompts.** `amp -x` is documented as built for
   scripted/piped use, but whether it can hit an unanswerable interactive
   prompt during an orb task (and hang) isn't verified.
 
-Confirm both against a real run before trusting `amp` as the implementer
-backend unattended, and tighten `orb_thread_is_done` (and `implement`'s
-timeout) to match what you actually see.
+Confirm the remaining one against a real run before trusting `amp` as the
+implementer backend fully unattended.
 
 ### Backends not yet built
 

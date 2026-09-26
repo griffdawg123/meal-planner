@@ -45,21 +45,17 @@ looks_like_exhausted() {
   grep -qiE "$EXHAUSTED_PATTERN" "$1"
 }
 
-# NOTE — UNVERIFIED: this was written without a live, authenticated `amp` session (amp login
-# had expired while building this), so the field/value below is a best guess about the shape
-# of `amp threads export`'s payload, not a confirmed fact. Before trusting dev/devloop's amp
-# backend for real, run `amp threads export <a-real-thread-id>` yourself, see what a finished
-# thread's payload actually looks like, and fix this function to match if it differs. Until
-# then this fails closed: if it can never confirm completion, implement() times out and asks
-# for a manual `dev/orb sync` rather than guessing and syncing a still-in-progress orb.
+# Confirmed against a real, already-finished orb thread's export payload: the completion
+# signal lives at meta.lastKnownAgentState.state, value "idle" once the agent has finished a
+# turn and is waiting for the next one. What value(s) it reports mid-task (still generating,
+# running a tool) are NOT confirmed — this was checked against a thread that was already done,
+# not one caught mid-run. That's fine for this function's actual job (poll until idle), but if
+# it ever reports "idle" too early (e.g. between tool calls rather than only at the end of the
+# whole task), implement() would sync prematurely. Watch the first few real runs for that.
 orb_thread_is_done() {
   local thread_id="$1" payload
   payload="$(amp threads export "$thread_id" 2>/dev/null)" || return 1
-  printf '%s' "$payload" | jq -e '
-    ([.status, .state, .executionState] | map(select(. != null and . != "")) | .[0] // "") as $s
-    | ($s | ascii_downcase) as $s
-    | $s == "completed" or $s == "done" or $s == "idle" or $s == "finished" or $s == "succeeded"
-  ' >/dev/null 2>&1
+  printf '%s' "$payload" | jq -e '.meta.lastKnownAgentState.state == "idle"' >/dev/null 2>&1
 }
 
 implement() {
