@@ -1,9 +1,9 @@
-# Household, member, and preference schema
+# Application schema
 
 [`schema.sql`](schema.sql) defines the foundational entities for the MVP. IDs are
 application-supplied `TEXT` values so callers can generate stable UUIDs without relying on a
-SQLite-specific ID extension. All tables record creation time as an ISO 8601 UTC text value,
-which sorts chronologically and is readable in SQLite. Names must be non-empty and trimmed.
+SQLite-specific ID extension. Household-domain tables record creation time as an ISO 8601 UTC
+text value, which sorts chronologically and is readable in SQLite. Names must be non-empty and trimmed.
 `household.timezone` is also required and trimmed; the service must validate it against the IANA
 timezone database because SQLite does not include one. Updated timestamps are omitted until a
 concrete audit or synchronization requirement justifies maintaining them.
@@ -11,7 +11,7 @@ concrete audit or synchronization requirement justifies maintaining them.
 Each member belongs to exactly one household. `ON DELETE CASCADE` deliberately removes those
 members when their household is deleted, avoiding orphaned identity join points during future
 account/data deletion. Future household-owned data should likewise carry a `household_id` foreign
-key, while individual preferences and Telegram or web identities can reference `member.id`.
+key, while individual preferences and identities reference `member.id`.
 
 `household.created_by_member_id` records the first member explicitly. Its composite foreign key to
 `member(household_id, id)` guarantees that the recorded creator is a member of that same household,
@@ -43,6 +43,14 @@ The composite foreign key from `preference(household_id, member_id)` to
 different household. SQLite permits the composite reference when `member_id` is `NULL`, which is
 the intentional household-level scope. Both foreign keys cascade deletion so preferences cannot
 outlive their household or individual owner.
+
+Web authentication is stored in three tables. `web_identity` links one normalized email address
+to a member. `magic_link` stores short-lived, single-use login challenges, and `web_session` stores
+the resulting authenticated sessions. Both bearer-token tables persist only SHA-256 token hashes;
+the raw token is returned to the caller for delivery or use and cannot be recovered from the
+database. Their timestamps are Unix seconds so expiry checks are direct integer comparisons. All
+three tables cascade on member deletion so removed members immediately lose their web identities,
+unused links, and sessions.
 
 SQLite foreign-key enforcement is connection-local. The schema enables it while applying the DDL;
 every application connection must also execute `PRAGMA foreign_keys = ON`.
