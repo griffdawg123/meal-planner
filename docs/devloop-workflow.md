@@ -17,13 +17,19 @@ dev/devloop doctor                       # sanity-checks all of the above
 By default both roles use the `claude` backend (`dev/backends/claude`), but
 as two independent invocations: implementation via headless `claude -p`,
 review via `claude ultrareview` (a separate cloud-hosted multi-agent review,
-not the same agent grading its own work). Override either with local git
-config if you want a different pairing:
+not the same agent grading its own work). A second backend,
+`dev/backends/amp`, wraps the existing Amp orb workflow — set one role to
+`amp` and the other to `claude` for real cross-provider independence rather
+than two `claude` invocations:
 
 ```bash
-git config --local devloop.implementerBackend claude
+git config --local devloop.implementerBackend amp
 git config --local devloop.reviewerBackend claude
 ```
+
+`amp implement` needs `amp login` run locally first (it wasn't logged in
+when this was written, so that path is untested end-to-end — see the
+caveats below before relying on it).
 
 `dev/devloop` refuses to run if both resolve to the same backend — the
 review has to be independent of the implementation.
@@ -107,12 +113,38 @@ A backend is any executable at `dev/backends/<name>` implementing:
 `dev/devloop` sets `DEVLOOP_STATE_DIR` in the environment before invoking
 either subcommand.
 
+### The amp backend
+
+`dev/backends/amp implement` dispatches via `dev/orb start` (from inside the
+issue's worktree, where `dev/orb`'s own preconditions already hold — see
+`docs/orb-workflow.md`), then has to detect when the orb is actually done
+before it's safe to `dev/orb sync` — syncing mid-run would pull a partial,
+still-being-written change. `dev/backends/amp review` sidesteps that problem
+entirely: it doesn't use an orb at all, since a plain-text review needs no
+repo checkout. It hands the PR diff and issue text to a synchronous, local
+`amp -x` call and posts the result as a PR comment itself — which also
+respects `AGENTS.md`'s rule that an orb must never hold GitHub credentials,
+since this path never gives it any.
+
+Two things in `implement` are genuinely unverified, because `amp` wasn't
+logged in when this was written and testing it costs real credits:
+
+- **Completion detection** (`orb_thread_is_done`) polls `amp threads export
+  <thread-id>` and checks for a `status`/`state`/`executionState` field
+  matching a "done" value. This is a best guess at that payload's shape, not
+  a confirmed fact. It fails closed: if it never matches within
+  `DEVLOOP_AMP_TIMEOUT_SECONDS` (default 2700s), `implement` stops and tells
+  you to run `dev/orb sync <thread-id>` yourself rather than guessing.
+- **Headless permission prompts.** `amp -x` is documented as built for
+  scripted/piped use, but whether it can hit an unanswerable interactive
+  prompt during an orb task (and hang) isn't verified.
+
+Confirm both against a real run before trusting `amp` as the implementer
+backend unattended, and tighten `orb_thread_is_done` (and `implement`'s
+timeout) to match what you actually see.
+
 ### Backends not yet built
 
-- `dev/backends/amp` — wraps the existing `dev/orb start` / `sync`. Needs a
-  short investigation into how to detect an orb thread's completion before
-  writing this (`dev/orb start` returns as soon as the orb *starts*, not
-  when it finishes).
 - `dev/backends/openrouter-hermes` — same contract, for a future
   OpenRouter-hosted Hermes agent.
 
