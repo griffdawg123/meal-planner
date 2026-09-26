@@ -464,6 +464,48 @@ func TestAddPreference(t *testing.T) {
 }
 
 func TestListPreferences(t *testing.T) {
+	t.Run("applies household preferences to every member by default", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		existingMember, err := service.AddMember(context.Background(), created.ID, "Existing Member")
+		if err != nil {
+			t.Fatalf("add existing member: %v", err)
+		}
+
+		allergy, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard)
+		if err != nil {
+			t.Fatalf("add household allergy: %v", err)
+		}
+		cookingTime, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{Int16: 4, Valid: true}, "under 30 minutes", household.CookingTime, household.Soft)
+		if err != nil {
+			t.Fatalf("add household cooking time preference: %v", err)
+		}
+
+		laterMember, err := service.AddMember(context.Background(), created.ID, "Later Member")
+		if err != nil {
+			t.Fatalf("add later member: %v", err)
+		}
+
+		for _, memberID := range []string{created.CreatorID, existingMember.ID, laterMember.ID} {
+			preferences, err := service.ListPreferences(context.Background(), created.ID, memberID, household.PreferenceFilter{})
+			if err != nil {
+				t.Fatalf("list preferences for member %q: %v", memberID, err)
+			}
+			gotIDs := map[string]bool{}
+			for _, preference := range preferences {
+				gotIDs[preference.ID] = true
+			}
+			if len(preferences) != 2 || !gotIDs[allergy.ID] || !gotIDs[cookingTime.ID] {
+				t.Errorf("preferences for member %q: got %+v, want exactly %+v and %+v", memberID, preferences, allergy, cookingTime)
+			}
+		}
+	})
+
 	t.Run("lists a member's own and the household's preferences together", func(t *testing.T) {
 		service := household.NewService(newTestDatabase(t))
 		created, err := service.CreateHousehold(
