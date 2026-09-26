@@ -48,7 +48,15 @@ Web authentication is stored in three tables. `web_identity` links one normalize
 to a member. `magic_link` stores short-lived, single-use login challenges, and `web_session` stores
 the resulting authenticated sessions. Both bearer-token tables persist only SHA-256 token hashes;
 the raw token is returned to the caller for delivery or use and cannot be recovered from the
-database. Their timestamps are Unix seconds so expiry checks are direct integer comparisons. All
+database. Their timestamps are Unix seconds so expiry checks are direct integer comparisons.
+
+A magic link belongs to exactly one member, and the schema itself enforces its lifecycle rather
+than leaving it to the service. `expires_at` must be after `created_at`. `used_at` is `NULL` until
+the link is consumed, and it may only be set within the link's lifetime:
+`created_at <= used_at < expires_at`, which matches the service's strict `expires_at > now` check.
+The `magic_link_single_use` trigger rejects any update to `used_at` once it is set, so a consumed
+link cannot be reset or consumed again. Expired or used rows are inert and may be pruned at any
+time. All
 three tables cascade on member deletion so removed members immediately lose their web identities,
 unused links, and sessions.
 

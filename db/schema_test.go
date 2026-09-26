@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"testing"
 
@@ -87,6 +88,123 @@ func TestPreferenceSchema(t *testing.T) {
 	`, "preference-wrong-household", "household-1", "member-2", "soft", "dislike", "mushrooms", 3); err == nil {
 		t.Fatal("insert accepted a preference for a member belonging to another household")
 	}
+}
+
+func TestMagicLinkSchema(t *testing.T) {
+	t.Run("stores an unused link for a member", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+	})
+
+	t.Run("rejects a link for an unknown member", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		if err := execMagicLink(database, tokenHash(1), "missing-member", 100, 200); err == nil {
+			t.Fatal("insert accepted a magic link for an unknown member: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects a token hash that is not a SHA-256 digest", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		if err := execMagicLink(database, []byte("raw-token"), "member-1", 100, 200); err == nil {
+			t.Fatal("insert accepted a non-digest token hash: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects a link that expires before it is created", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		if err := execMagicLink(database, tokenHash(1), "member-1", 200, 200); err == nil {
+			t.Fatal("insert accepted expires_at equal to created_at: got nil error, want error")
+		}
+	})
+
+	t.Run("allows consuming a link within its lifetime", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+		if _, err := database.Exec(`UPDATE magic_link SET used_at = 150`); err != nil {
+			t.Fatalf("consume magic link: got %v, want nil", err)
+		}
+	})
+
+	t.Run("rejects consuming a link at or after its expiry", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+		for _, usedAt := range []int64{200, 201} {
+			if _, err := database.Exec(`UPDATE magic_link SET used_at = ?`, usedAt); err == nil {
+				t.Errorf("consume at %d: got nil error, want error", usedAt)
+			}
+		}
+	})
+
+	t.Run("rejects consuming a link before it was created", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+		if _, err := database.Exec(`UPDATE magic_link SET used_at = 99`); err == nil {
+			t.Fatal("consume before creation: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects clearing or changing the use of a consumed link", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+		if _, err := database.Exec(`UPDATE magic_link SET used_at = 150`); err != nil {
+			t.Fatalf("consume magic link: %v", err)
+		}
+
+		for _, statement := range []string{
+			`UPDATE magic_link SET used_at = NULL`,
+			`UPDATE magic_link SET used_at = 160`,
+		} {
+			if _, err := database.Exec(statement); err == nil {
+				t.Errorf("%s: got nil error, want error", statement)
+			}
+		}
+
+		var usedAt int64
+		if err := database.QueryRow(`SELECT used_at FROM magic_link`).Scan(&usedAt); err != nil {
+			t.Fatalf("read used_at: %v", err)
+		}
+		if usedAt != 150 {
+			t.Errorf("used_at after rejected updates: got %d, want 150", usedAt)
+		}
+	})
+
+	t.Run("deleting a member cascades to its magic links", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		if _, err := database.Exec(
+			`INSERT INTO member (id, household_id, name) VALUES (?, ?, ?)`,
+			"member-2", "household-1", "Second Member",
+		); err != nil {
+			t.Fatalf("insert second member: %v", err)
+		}
+		insertMagicLink(t, database, tokenHash(1), "member-2", 100, 200)
+
+		if _, err := database.Exec(`DELETE FROM member WHERE id = ?`, "member-2"); err != nil {
+			t.Fatalf("delete member: %v", err)
+		}
+
+		var links int
+		if err := database.QueryRow(`SELECT count(*) FROM magic_link`).Scan(&links); err != nil {
+			t.Fatalf("count magic links: %v", err)
+		}
+		if links != 0 {
+			t.Errorf("magic links remaining after member deletion: got %d, want 0", links)
+		}
+	})
 }
 
 func TestApplySchemaCanBeReapplied(t *testing.T) {
@@ -185,4 +303,26 @@ func insertHousehold(t *testing.T, database *sql.DB, householdID, memberID strin
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit household creation: %v", err)
 	}
+}
+
+func insertMagicLink(t *testing.T, database *sql.DB, hash []byte, memberID string, createdAt, expiresAt int64) {
+	t.Helper()
+
+	if err := execMagicLink(database, hash, memberID, createdAt, expiresAt); err != nil {
+		t.Fatalf("insert magic link: %v", err)
+	}
+}
+
+func execMagicLink(database *sql.DB, hash []byte, memberID string, createdAt, expiresAt int64) error {
+	_, err := database.Exec(
+		`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		hash, memberID, createdAt, expiresAt,
+	)
+	return err
+}
+
+// tokenHash returns a distinct 32-byte value shaped like a SHA-256 digest.
+func tokenHash(seed byte) []byte {
+	hash := sha256.Sum256([]byte{seed})
+	return hash[:]
 }

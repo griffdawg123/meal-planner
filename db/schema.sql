@@ -97,12 +97,20 @@ CREATE TABLE IF NOT EXISTS magic_link (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
                     CHECK (expires_at > created_at),
-    used_at    INTEGER,
+    used_at    INTEGER
+                    CHECK (used_at IS NULL OR (used_at >= created_at AND used_at < expires_at)),
 
     FOREIGN KEY (member_id)
         REFERENCES member (id)
         ON DELETE CASCADE
 );
+
+CREATE TRIGGER IF NOT EXISTS magic_link_single_use
+BEFORE UPDATE OF used_at ON magic_link
+WHEN OLD.used_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'magic link has already been used');
+END;
 
 CREATE TABLE IF NOT EXISTS web_session (
     token_hash BLOB PRIMARY KEY
