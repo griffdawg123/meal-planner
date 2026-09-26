@@ -101,7 +101,15 @@ implement() {
     die "orb thread $thread_id did not report completion within ${timeout_seconds}s (see the UNVERIFIED note on orb_thread_is_done above — this may be a detection bug, not a stuck orb); sync it manually once you've confirmed it's done: (cd $worktree && dev/orb sync $thread_id)"
   fi
 
-  (cd "$worktree" && "$dev_orb" sync "$thread_id")
+  # NOT `dev/orb sync` here: it calls bare `amp sync <thread>`, which defaults to *live*,
+  # continuous mirroring ("keep watching for more changes") and never exits on its own — it
+  # only becomes a one-shot apply-and-exit with --apply. That's fine for a human running
+  # `dev/orb sync` interactively (they can watch it settle and Ctrl+C), but it hangs forever
+  # headless. --checkout avoids a second hang risk: without it, a checkout that "differs" from
+  # the thread's commit triggers an interactive prompt with no TTY to answer it. The worktree
+  # is freshly created for this task and touched by nothing else, so checking out the thread's
+  # commit unconditionally is safe here.
+  (cd "$worktree" && amp sync --apply --checkout "$thread_id")
 }
 
 review() {
