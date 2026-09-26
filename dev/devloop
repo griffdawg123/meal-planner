@@ -214,13 +214,15 @@ mark_needs_attention() {
 
 # For when the implementer backend ran successfully but the worktree ended up with nothing to
 # commit — the issue turned out to already be satisfied by existing code (e.g. an earlier
-# issue's work covered it too). This is not a failure: it doesn't stop the loop, and it uses
-# its own label rather than devloop:needs-attention so it doesn't read as "something's broken."
+# issue's work covered it too). This is not a failure: it doesn't stop the loop, and closes the
+# issue directly rather than flagging devloop:needs-attention, which is for problems that
+# actually need a human to look at something.
 mark_no_changes_needed() {
   local issue_number="$1"
+  gh issue comment "$issue_number" --body "dev/devloop: the implementer backend made no changes — this issue already appears to be satisfied by existing code. Closing without a PR." 2>/dev/null || true
   gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NO_CHANGES_NEEDED" 2>/dev/null || true
-  gh issue comment "$issue_number" --body "dev/devloop: the implementer backend made no changes — this issue appears to already be satisfied by existing code. Left open with no PR for a human to confirm and close (or dispute)." 2>/dev/null || true
-  printf 'issue #%s needed no changes\n' "$issue_number"
+  gh issue close "$issue_number" 2>/dev/null || true
+  printf 'issue #%s needed no changes; closed\n' "$issue_number"
 }
 
 # Returns 0 (continue looping), 1 (stop looping, failure), or
