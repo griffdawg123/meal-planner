@@ -72,6 +72,13 @@ Do not commit or publish directly to `main`. All work — local edits and synced
 - Open a pull request for the branch with `gh pr create`, referencing the GitHub issue(s) it addresses.
 - Merge only on the user's explicit approval — same bar as publishing itself. Do not self-merge because CI or review looks clean.
 
+  The one exception is `dev/devloop` (see `docs/devloop-workflow.md`), which
+  may merge a PR without per-PR human approval — but only when it ran the
+  full gate itself: an independent reviewer backend passed and required CI
+  checks are green. This does not extend to any other agent or orb work,
+  which still needs explicit human approval to merge, and it does not permit
+  `dev/devloop` to skip, weaken, or bypass its own gate.
+
 `main` is intended to be protected on GitHub (require a pull request before merging; no force pushes or deletions). If a required action to configure or verify that protection is denied by the local permission system, stop, explain what was attempted and why, and let the user configure it or grant the permission — do not look for a workaround.
 
 ## Publishing

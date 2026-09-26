@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+
+# Claude Code backend for dev/devloop. Implements the backend contract
+# described in docs/devloop-workflow.md:
+#
+#   dev/backends/claude implement <worktree-path> <prompt-file>
+#   dev/backends/claude review <pr-number> <issue-number>
+#
+# Exit codes: 0 = success, 1 = failed, 75 = paused (daily usage limit hit;
+# writes $DEVLOOP_STATE_DIR/paused and leaves everything else untouched).
+
+set -euo pipefail
+
+readonly PAUSE_EXIT_CODE=75
+readonly USAGE_LIMIT_PATTERN='usage limit|limit reset|resets at|rate limit exceeded'
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+mark_paused() {
+  local detail="$1"
+  [[ -n "${DEVLOOP_STATE_DIR:-}" ]] || die "DEVLOOP_STATE_DIR must be set by the orchestrator"
+  mkdir -p "$DEVLOOP_STATE_DIR"
+  printf '%s: %s\n' "$(date -u +%FT%TZ)" "$detail" >"$DEVLOOP_STATE_DIR/paused"
+}
+
+# NOTE: the exact wording Claude Code uses when a subscription's daily usage
+# limit is hit hasn't been confirmed against a real occurrence yet. If this
+# heuristic misses it, tighten USAGE_LIMIT_PATTERN once you see the real
+# message in a paused-but-not-detected run.
+looks_like_usage_limit() {
+  grep -qiE "$USAGE_LIMIT_PATTERN" "$1"
+}
+
+implement() {
+  local worktree="$1" prompt_file="$2" output_file rc
+
+  [[ -d "$worktree" ]] || die "worktree not found: $worktree"
+  [[ -f "$prompt_file" ]] || die "prompt file not found: $prompt_file"
+
+  output_file="$(mktemp)"
+  trap 'rm -f "$output_file"' EXIT
+
+  set +e
+  (
+    cd "$worktree"
+    claude -p "$(cat "$prompt_file")" \
+      --permission-mode acceptEdits \
+      --permission-prompts none \
+      --allowedTools "Bash(go build *) Bash(go run *) Bash(go test *) Bash(go vet *) Bash(gofmt *) Edit Write Read Glob Grep" \
+      --output-format json
+  ) >"$output_file" 2>&1
+  rc=$?
+  set -e
+
+  if looks_like_usage_limit "$output_file"; then
+    mark_paused "implement backend hit usage limit"
+    exit "$PAUSE_EXIT_CODE"
+  fi
+
+  cat "$output_file"
+  [[ "$rc" -eq 0 ]] || exit 1
+}
+
+review() {
+  local pr_number="$1" issue_number="$2" output_file rc findings
+
+  output_file="$(mktemp)"
+  trap 'rm -f "$output_file"' EXIT
+
+  set +e
+  claude ultrareview "$pr_number" --json --post >"$output_file" 2>&1
+  rc=$?
+  set -e
+
+  if looks_like_usage_limit "$output_file"; then
+    mark_paused "review backend hit usage limit"
+    exit "$PAUSE_EXIT_CODE"
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    cat "$output_file" >&2
+    exit 1
+  fi
+
+  findings="$(jq 'length' "$output_file" 2>/dev/null || printf '1\n')"
+  cat "$output_file"
+
+  if [[ "$findings" -eq 0 ]]; then
+    printf 'ultrareview: no findings on PR #%s (issue #%s)\n' "$pr_number" "$issue_number"
+    exit 0
+  else
+    printf 'ultrareview: %s finding(s) on PR #%s (issue #%s)\n' "$findings" "$pr_number" "$issue_number"
+    exit 1
+  fi
+}
+
+main() {
+  local command="${1:-}"
+  case "$command" in
+    implement) shift; [[ $# -eq 2 ]] || die "usage: implement <worktree-path> <prompt-file>"; implement "$@" ;;
+    review) shift; [[ $# -eq 2 ]] || die "usage: review <pr-number> <issue-number>"; review "$@" ;;
+    *) die "usage: $0 implement <worktree-path> <prompt-file> | review <pr-number> <issue-number>" ;;
+  esac
+}
+
+main "$@"
