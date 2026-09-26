@@ -41,7 +41,13 @@ implement() {
   [[ -f "$prompt_file" ]] || die "prompt file not found: $prompt_file"
 
   output_file="$(mktemp)"
-  trap 'rm -f "$output_file"' EXIT
+  # NOT `trap ... EXIT` here: that fires at actual process exit, not when this function
+  # returns. On a clean success this function falls through to a plain return (no early
+  # `exit`), so by the time the trap runs, output_file's `local` scope is long gone and the
+  # trap body fails with "output_file: unbound variable" under set -u. Confirmed live: this
+  # was invisible until the first real success of this backend, because every prior run had
+  # exited early (via `exit "$PAUSE_EXIT_CODE"` or `exit 1`) while output_file was still in
+  # scope. Explicit rm -f at every exit point sidesteps the whole scoping question.
 
   set +e
   (
@@ -57,10 +63,12 @@ implement() {
 
   if looks_like_usage_limit "$output_file"; then
     mark_paused "implement backend hit usage limit"
+    rm -f "$output_file"
     exit "$PAUSE_EXIT_CODE"
   fi
 
   cat "$output_file"
+  rm -f "$output_file"
   [[ "$rc" -eq 0 ]] || exit 1
 }
 
@@ -75,7 +83,9 @@ review() {
   # needs-attention this way.
   output_file="$(mktemp)"
   progress_file="$(mktemp)"
-  trap 'rm -f "$output_file" "$progress_file"' EXIT
+  # Not `trap ... EXIT` (see implement()'s comment on the same pattern) — explicit rm -f at
+  # every exit point instead, so cleanup never depends on which scope is active when the
+  # process actually exits.
 
   set +e
   claude ultrareview "$pr_number" --json --post >"$output_file" 2>"$progress_file"
@@ -86,17 +96,20 @@ review() {
 
   if looks_like_usage_limit "$output_file" || looks_like_usage_limit "$progress_file"; then
     mark_paused "review backend hit usage limit"
+    rm -f "$output_file" "$progress_file"
     exit "$PAUSE_EXIT_CODE"
   fi
 
   if [[ "$rc" -ne 0 ]]; then
     cat "$output_file" >&2
+    rm -f "$output_file" "$progress_file"
     exit 1
   fi
 
   findings="$(jq 'length' "$output_file")" ||
     die "ultrareview --json output was not valid JSON: $(cat "$output_file")"
   cat "$output_file"
+  rm -f "$output_file" "$progress_file"
 
   if [[ "$findings" -eq 0 ]]; then
     printf 'ultrareview: no findings on PR #%s (issue #%s)\n' "$pr_number" "$issue_number"
