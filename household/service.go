@@ -307,11 +307,23 @@ type PreferenceFilter struct {
 
 // ListPreferences returns a household's preferences, optionally narrowed by filter. When
 // memberID is set, the result also includes that member's own preferences alongside the
-// household-wide ones; when it is empty, only household-wide preferences are returned. An
-// unknown household or member is not an error: it naturally has no rows, so callers can treat
-// unknown and known-empty identically (the same convention ListMembers uses).
+// household-wide ones; when it is empty, only household-wide preferences are returned. The member
+// must belong to the household. An unknown household is not an error: it naturally has no rows, so
+// callers can treat unknown and known-empty identically (the same convention ListMembers uses).
 func (s *Service) ListPreferences(ctx context.Context, householdID, memberID string, filter PreferenceFilter) ([]Preference, error) {
 	preferences := []Preference{}
+	if memberID != "" {
+		var exists int
+		err := s.database.QueryRowContext(ctx,
+			`SELECT 1 FROM member WHERE household_id = ? AND id = ?`, householdID, memberID,
+		).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %q", ErrMemberNotFound, memberID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: check member: %v", ErrInternal, err)
+		}
+	}
 
 	query := strings.Builder{}
 	query.WriteString(`

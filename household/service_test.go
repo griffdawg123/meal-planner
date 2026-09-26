@@ -528,7 +528,7 @@ func TestListPreferences(t *testing.T) {
 		}
 	})
 
-	t.Run("returns an empty slice for an unknown member", func(t *testing.T) {
+	t.Run("rejects an unknown member", func(t *testing.T) {
 		service := household.NewService(newTestDatabase(t))
 		created, err := service.CreateHousehold(
 			context.Background(), "Household", "Australia/Sydney", "Founder",
@@ -540,21 +540,16 @@ func TestListPreferences(t *testing.T) {
 			t.Fatalf("add household preference: %v", err)
 		}
 
-		// An unknown member still sees household-wide preferences, matching AddPreference's
-		// treatment of an empty member as "household-wide" rather than a member match failure.
-		preferences, err := service.ListPreferences(context.Background(), created.ID, "missing-member", household.PreferenceFilter{})
-		if err != nil {
-			t.Fatalf("list preferences: %v", err)
-		}
-		if len(preferences) != 1 {
-			t.Errorf("preferences for unknown member: got %+v, want the household-wide preference only", preferences)
+		_, err = service.ListPreferences(context.Background(), created.ID, "missing-member", household.PreferenceFilter{})
+		if !errors.Is(err, household.ErrMemberNotFound) {
+			t.Fatalf("error: got %v, want ErrMemberNotFound", err)
 		}
 	})
 
 	t.Run("returns an empty slice for an unknown household", func(t *testing.T) {
 		service := household.NewService(newTestDatabase(t))
 
-		preferences, err := service.ListPreferences(context.Background(), "missing-household", "missing-member", household.PreferenceFilter{})
+		preferences, err := service.ListPreferences(context.Background(), "missing-household", "", household.PreferenceFilter{})
 		if err != nil {
 			t.Fatalf("list preferences: %v", err)
 		}
@@ -779,6 +774,113 @@ func TestRemovePreference(t *testing.T) {
 	})
 }
 
+func TestCrossHouseholdIsolation(t *testing.T) {
+	t.Run("a household cannot read or remove another household's member", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		first, err := service.CreateHousehold(
+			context.Background(), "First Household", "Australia/Sydney", "First Founder",
+		)
+		if err != nil {
+			t.Fatalf("create first household: %v", err)
+		}
+		second, err := service.CreateHousehold(
+			context.Background(), "Second Household", "Australia/Sydney", "Second Founder",
+		)
+		if err != nil {
+			t.Fatalf("create second household: %v", err)
+		}
+		otherMember, err := service.AddMember(context.Background(), second.ID, "Other Member")
+		if err != nil {
+			t.Fatalf("add member to second household: %v", err)
+		}
+
+		members, err := service.ListMembers(context.Background(), first.ID)
+		if err != nil {
+			t.Fatalf("list first household members: %v", err)
+		}
+		if _, ok := memberWithID(members, otherMember.ID); ok {
+			t.Errorf("other household member visibility: got member %q, want absent", otherMember.ID)
+		}
+
+		err = service.RemoveMember(context.Background(), first.ID, otherMember.ID)
+		if !errors.Is(err, household.ErrMemberNotFound) {
+			t.Fatalf("cross-household removal error: got %v, want ErrMemberNotFound", err)
+		}
+		otherMembers, err := service.ListMembers(context.Background(), second.ID)
+		if err != nil {
+			t.Fatalf("list second household members: %v", err)
+		}
+		if _, ok := memberWithID(otherMembers, otherMember.ID); !ok {
+			t.Errorf("other household member after removal attempt: got absent, want member %q", otherMember.ID)
+		}
+	})
+
+	t.Run("a household cannot read, add, or remove another household's preferences", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		first, err := service.CreateHousehold(
+			context.Background(), "First Household", "Australia/Sydney", "First Founder",
+		)
+		if err != nil {
+			t.Fatalf("create first household: %v", err)
+		}
+		second, err := service.CreateHousehold(
+			context.Background(), "Second Household", "Australia/Sydney", "Second Founder",
+		)
+		if err != nil {
+			t.Fatalf("create second household: %v", err)
+		}
+		otherMember, err := service.AddMember(context.Background(), second.ID, "Other Member")
+		if err != nil {
+			t.Fatalf("add member to second household: %v", err)
+		}
+		otherPreference, err := service.AddPreference(
+			context.Background(), second.ID, otherMember.ID,
+			sql.NullInt16{Int16: 4, Valid: true}, "Italian", household.Cuisine, household.Soft,
+		)
+		if err != nil {
+			t.Fatalf("add preference to second household: %v", err)
+		}
+
+		preferences, err := service.ListPreferences(
+			context.Background(), first.ID, first.CreatorID, household.PreferenceFilter{},
+		)
+		if err != nil {
+			t.Fatalf("list first household preferences: %v", err)
+		}
+		if _, ok := preferenceWithID(preferences, otherPreference.ID); ok {
+			t.Errorf("other household preference visibility: got preference %q, want absent", otherPreference.ID)
+		}
+		_, err = service.ListPreferences(
+			context.Background(), first.ID, otherMember.ID, household.PreferenceFilter{},
+		)
+		if !errors.Is(err, household.ErrMemberNotFound) {
+			t.Fatalf("cross-household member read error: got %v, want ErrMemberNotFound", err)
+		}
+
+		_, err = service.AddPreference(
+			context.Background(), first.ID, otherMember.ID,
+			sql.NullInt16{}, "peanuts", household.Allergy, household.Hard,
+		)
+		if !errors.Is(err, household.ErrMemberNotFound) {
+			t.Fatalf("cross-household addition error: got %v, want ErrMemberNotFound", err)
+		}
+
+		err = service.RemovePreference(context.Background(), first.ID, first.CreatorID, otherPreference.ID)
+		if !errors.Is(err, household.ErrPreferenceNotFound) {
+			t.Fatalf("cross-household removal error: got %v, want ErrPreferenceNotFound", err)
+		}
+		otherPreferences, err := service.ListPreferences(
+			context.Background(), second.ID, otherMember.ID, household.PreferenceFilter{},
+		)
+		if err != nil {
+			t.Fatalf("list second household preferences: %v", err)
+		}
+		if _, ok := preferenceWithID(otherPreferences, otherPreference.ID); !ok {
+			t.Errorf("other household preference after write attempts: got absent, want preference %q", otherPreference.ID)
+		}
+	})
+}
+
 func memberWithID(members []household.Member, id string) (household.Member, bool) {
 	for _, member := range members {
 		if member.ID == id {
@@ -786,6 +888,15 @@ func memberWithID(members []household.Member, id string) (household.Member, bool
 		}
 	}
 	return household.Member{}, false
+}
+
+func preferenceWithID(preferences []household.Preference, id string) (household.Preference, bool) {
+	for _, preference := range preferences {
+		if preference.ID == id {
+			return preference, true
+		}
+	}
+	return household.Preference{}, false
 }
 
 func newTestDatabase(t *testing.T) *sql.DB {
