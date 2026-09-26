@@ -76,6 +76,46 @@ CREATE TABLE IF NOT EXISTS preference (
         ON DELETE CASCADE
 );
 
--- Future auth identities should reference member(id).
+CREATE TABLE IF NOT EXISTS web_identity (
+    email      TEXT PRIMARY KEY
+                    CHECK (email = lower(trim(email)) AND email <> ''),
+    member_id  TEXT NOT NULL UNIQUE
+                    CHECK (member_id <> ''),
+    created_at INTEGER NOT NULL
+                    DEFAULT (unixepoch()),
+
+    FOREIGN KEY (member_id)
+        REFERENCES member (id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS magic_link (
+    token_hash BLOB PRIMARY KEY
+                    CHECK (length(token_hash) = 32),
+    member_id  TEXT NOT NULL
+                    CHECK (member_id <> ''),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+                    CHECK (expires_at > created_at),
+    used_at    INTEGER,
+
+    FOREIGN KEY (member_id)
+        REFERENCES member (id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS web_session (
+    token_hash BLOB PRIMARY KEY
+                    CHECK (length(token_hash) = 32),
+    member_id  TEXT NOT NULL
+                    CHECK (member_id <> ''),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+                    CHECK (expires_at > created_at),
+
+    FOREIGN KEY (member_id)
+        REFERENCES member (id)
+        ON DELETE CASCADE
+);
 
 COMMIT;
