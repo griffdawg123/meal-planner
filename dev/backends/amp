@@ -109,7 +109,7 @@ implement() {
   # the thread's commit triggers an interactive prompt with no TTY to answer it. The worktree
   # is freshly created for this task and touched by nothing else, so checking out the thread's
   # commit unconditionally is safe here.
-  (cd "$worktree" && amp sync --apply --checkout "$thread_id")
+  (cd "$worktree" && amp sync --apply "$thread_id" --checkout)
 }
 
 review() {
