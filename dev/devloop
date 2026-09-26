@@ -40,7 +40,11 @@ repository_root() {
 }
 
 state_directory() {
-  git rev-parse --git-path devloop-state
+  # --path-format=absolute matters: without it this is relative to cwd (".git/devloop-state"),
+  # which silently breaks the moment a backend cd's into an issue's worktree before reading a
+  # path built from this — worktrees have a `.git` FILE, not a directory, so the same relative
+  # string resolves somewhere completely different (or fails outright) once cwd changes.
+  git rev-parse --path-format=absolute --git-path devloop-state
 }
 
 base_branch() {
@@ -125,6 +129,14 @@ doctor() {
   fi
 }
 
+require_labels() {
+  local names
+  names="$(gh label list --json name -q '.[].name' 2>/dev/null)" || die "could not list repo labels"
+  for label in "$LABEL_IN_PROGRESS" "$LABEL_NEEDS_ATTENTION"; do
+    grep -qxF "$label" <<<"$names" || die "label '$label' does not exist; run: dev/devloop init-labels"
+  done
+}
+
 init_labels() {
   require_command gh
   gh label create "$LABEL_IN_PROGRESS" --color FBCA04 \
@@ -199,6 +211,14 @@ mark_needs_attention() {
 
 # Returns 0 (continue looping), 1 (stop looping, failure), or
 # $PAUSE_EXIT_CODE (stop looping, resume later).
+#
+# IMPORTANT for anyone editing this function: it is always called as
+# `run_one_cycle || rc=$?` (see run_loop), and in bash that disables `set -e` for this
+# function's *entire* execution, including everything it calls — not just the final
+# statement. (Confirmed: `f() { false; echo "still ran"; }; f || rc=$?` really does print
+# "still ran".) A bare fallible command in here will fail silently rather than stop
+# anything. Every fallible command below must be explicitly checked (`cmd || …`) — don't
+# rely on set -e to catch a mistake here, it won't.
 run_one_cycle() {
   local state_dir issue_number title body parent_number parent_body phase
   local worktree branch prompt_file implementer reviewer pr_number
@@ -225,26 +245,37 @@ run_one_cycle() {
     # shellcheck disable=SC1090
     source "$state_dir/current"
   else
-    issue_number="$(pick_issue)"
+    issue_number="$(pick_issue)" || die "failed to list issues"
     if [[ -z "$issue_number" ]]; then
       printf 'no open, unclaimed task issues found\n'
       return 1
     fi
-    title="$(gh issue view "$issue_number" --json title -q .title)"
-    body="$(gh issue view "$issue_number" --json body -q .body)"
+    title="$(gh issue view "$issue_number" --json title -q .title)" ||
+      die "failed to read issue #$issue_number"
+    body="$(gh issue view "$issue_number" --json body -q .body)" ||
+      die "failed to read issue #$issue_number"
 
     parent_number="$(printf '%s' "$body" | grep -oE 'Parent story: #[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
     parent_body="$(parent_story_body "$body")"
 
-    gh issue edit "$issue_number" --add-label "$LABEL_IN_PROGRESS"
+    # Nothing has been claimed yet, so a failure here is a plain die rather than
+    # mark_needs_attention — there is nothing to roll back or label.
+    gh issue edit "$issue_number" --add-label "$LABEL_IN_PROGRESS" ||
+      die "failed to label issue #$issue_number as $LABEL_IN_PROGRESS"
 
+    # The issue is claimed as of the line above, so every failure from here on must go
+    # through mark_needs_attention rather than die, or the issue is left labeled
+    # in-progress forever with nothing actually happening.
     branch="issue-$issue_number"
     worktree="$root/../meal-planner-issue-$issue_number"
-    git fetch "$GITHUB_REMOTE" "$(base_branch)"
-    git worktree add "$worktree" -b "$branch" "$GITHUB_REMOTE/$(base_branch)"
+    git fetch "$GITHUB_REMOTE" "$(base_branch)" ||
+      { mark_needs_attention "$issue_number" "git fetch failed"; return 1; }
+    git worktree add "$worktree" -b "$branch" "$GITHUB_REMOTE/$(base_branch)" ||
+      { mark_needs_attention "$issue_number" "git worktree add failed"; return 1; }
 
     prompt_file="$state_dir/prompt-$issue_number.md"
-    build_prompt_file "$issue_number" "$title" "$body" "$parent_number" "$parent_body" "$prompt_file"
+    build_prompt_file "$issue_number" "$title" "$body" "$parent_number" "$parent_body" "$prompt_file" ||
+      { mark_needs_attention "$issue_number" "failed to write the prompt file"; return 1; }
 
     pr_number=""
     {
@@ -292,12 +323,16 @@ run_one_cycle() {
 
     (cd "$worktree" && git add -A && git commit -m "$title
 
-Closes #$issue_number")
-    (cd "$worktree" && git push -u "$GITHUB_REMOTE" "$branch")
-    pr_number="$(cd "$worktree" && gh pr create --title "$title" --body "Closes #$issue_number" --base "$(base_branch)" --head "$branch" --json number -q .number)"
+Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit failed"; return 1; }
+    (cd "$worktree" && git push -u "$GITHUB_REMOTE" "$branch") ||
+      { mark_needs_attention "$issue_number" "git push failed"; return 1; }
+    pr_number="$(cd "$worktree" && gh pr create --title "$title" --body "Closes #$issue_number" --base "$(base_branch)" --head "$branch" --json number -q .number)" ||
+      { mark_needs_attention "$issue_number" "gh pr create failed"; return 1; }
 
-    sed -i "s/^pr_number=.*/pr_number=$(printf '%q' "$pr_number")/" "$state_dir/current"
-    sed -i "s/^phase=.*/phase=review/" "$state_dir/current"
+    sed -i "s/^pr_number=.*/pr_number=$(printf '%q' "$pr_number")/" "$state_dir/current" ||
+      die "failed to record the PR number in state"
+    sed -i "s/^phase=.*/phase=review/" "$state_dir/current" ||
+      die "failed to advance state to the review phase"
     phase="review"
   fi
 
@@ -319,7 +354,8 @@ Closes #$issue_number")
       return 1
     fi
 
-    gh pr merge "$pr_number" --squash --delete-branch
+    gh pr merge "$pr_number" --squash --delete-branch ||
+      { mark_needs_attention "$issue_number" "gh pr merge failed"; return 1; }
     git worktree remove "$worktree" --force 2>/dev/null || true
     rm -f "$state_dir/current" "$prompt_file"
     printf 'merged PR #%s for issue #%s\n' "$pr_number" "$issue_number"
@@ -330,6 +366,8 @@ Closes #$issue_number")
 run_loop() {
   local once=0
   [[ "${1:-}" == "--once" ]] && once=1
+
+  require_labels
 
   while true; do
     local rc=0
