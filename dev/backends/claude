@@ -65,17 +65,26 @@ implement() {
 }
 
 review() {
-  local pr_number="$1" issue_number="$2" output_file rc findings
+  local pr_number="$1" issue_number="$2" output_file progress_file rc findings
 
+  # --json prints the raw bugs.json array on stdout; everything else (progress, "posting to
+  # PR...", any error text) goes to stderr. Keep them separate — merging them with 2>&1 (as an
+  # earlier version of this did) makes stdout unparseable JSON, and `jq` failing to parse it
+  # was silently treated as "1 finding" via a `|| printf 1` fallback. Confirmed live: a real
+  # zero-finding review got misreported as 1 finding and wrongly sent the issue to
+  # needs-attention this way.
   output_file="$(mktemp)"
-  trap 'rm -f "$output_file"' EXIT
+  progress_file="$(mktemp)"
+  trap 'rm -f "$output_file" "$progress_file"' EXIT
 
   set +e
-  claude ultrareview "$pr_number" --json --post >"$output_file" 2>&1
+  claude ultrareview "$pr_number" --json --post >"$output_file" 2>"$progress_file"
   rc=$?
   set -e
 
-  if looks_like_usage_limit "$output_file"; then
+  cat "$progress_file" >&2
+
+  if looks_like_usage_limit "$output_file" || looks_like_usage_limit "$progress_file"; then
     mark_paused "review backend hit usage limit"
     exit "$PAUSE_EXIT_CODE"
   fi
@@ -85,7 +94,8 @@ review() {
     exit 1
   fi
 
-  findings="$(jq 'length' "$output_file" 2>/dev/null || printf '1\n')"
+  findings="$(jq 'length' "$output_file")" ||
+    die "ultrareview --json output was not valid JSON: $(cat "$output_file")"
   cat "$output_file"
 
   if [[ "$findings" -eq 0 ]]; then
