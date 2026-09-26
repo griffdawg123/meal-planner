@@ -91,6 +91,29 @@ The usage-limit detection is a text heuristic (`dev/backends/claude`'s
 yet — tighten it the first time a run pauses unexpectedly or fails to pause
 when it should have.
 
+## Push notifications
+
+Every stop condition — `devloop:needs-attention`, a pause, or the backlog
+running dry — prints to stderr and, if configured, also sends a push
+notification via [ntfy](https://ntfy.sh). This matters most for `dev/devloop
+run` (continuous mode) or anything unattended: without it, the *only* signal
+that the loop stopped is the GitHub label/comment, or noticing the process
+died.
+
+It's opt-in and off by default. Set your own topic yourself — a topic on the
+public `ntfy.sh` instance is unauthenticated, so anyone who knows it can read
+(or publish to) it, and there's no reason to tell anyone else, including an
+agent, what it is:
+
+```bash
+git config --local devloop.ntfyTopic '<your-topic>'
+git config --local devloop.ntfyServer 'https://ntfy.sh'   # optional; this is the default
+```
+
+`dev/devloop doctor` reports whether notifications are enabled (and warns if
+`curl` isn't installed). A notification failure never affects the loop's own
+exit code — `notify()` always swallows its own errors.
+
 ## Self-improving AGENTS.md
 
 The implementer prompt asks the agent to call out, in its final summary,

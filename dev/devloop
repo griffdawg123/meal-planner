@@ -22,6 +22,8 @@ tests and an independent review both pass. See docs/devloop-workflow.md.
 Configuration (local git config):
   devloop.implementerBackend   default: claude
   devloop.reviewerBackend      default: claude
+  devloop.ntfyTopic            ntfy.sh topic for stop/pause notifications; unset = disabled
+  devloop.ntfyServer           default: https://ntfy.sh
   orbWorkflow.testCommand      reused from dev/orb; required
   orbWorkflow.baseBranch       reused from dev/orb; default: main
 EOF
@@ -54,6 +56,20 @@ base_branch() {
 
 test_command() {
   git config --get orbWorkflow.testCommand 2>/dev/null || true
+}
+
+# Sends a push notification via ntfy (https://ntfy.sh by default, or your own server via
+# devloop.ntfyServer) so an unattended `dev/devloop run` doesn't stop silently. Opt-in and a
+# no-op until devloop.ntfyTopic is set — set it yourself with:
+#   git config --local devloop.ntfyTopic '<your-topic>'
+# so the topic itself never has to be told to anyone else. A notification failure (no
+# internet, bad topic) must never break the loop's own exit code, hence the `|| true`.
+notify() {
+  local title="$1" message="$2" topic server
+  topic="$(git config --get devloop.ntfyTopic 2>/dev/null || true)"
+  [[ -n "$topic" ]] || return 0
+  server="$(git config --get devloop.ntfyServer 2>/dev/null || printf 'https://ntfy.sh\n')"
+  curl -fsS --max-time 10 -H "Title: $title" -d "$message" "$server/$topic" >/dev/null 2>&1 || true
 }
 
 backend_for() {
@@ -97,6 +113,18 @@ doctor() {
   printf 'Implementer backend: %s\n' "$implementer"
   printf 'Reviewer backend:    %s\n' "$reviewer"
   printf 'Test command:        %s\n' "${test_cmd:-not configured (required before running)}"
+
+  local ntfy_topic
+  ntfy_topic="$(git config --get devloop.ntfyTopic 2>/dev/null || true)"
+  if [[ -n "$ntfy_topic" ]]; then
+    if command -v curl >/dev/null 2>&1; then
+      printf 'Notifications:       enabled (%s/%s)\n' "$(git config --get devloop.ntfyServer 2>/dev/null || echo https://ntfy.sh)" "$ntfy_topic"
+    else
+      printf 'Notifications:       devloop.ntfyTopic is set but curl is not installed; notify() will silently no-op\n'
+    fi
+  else
+    printf 'Notifications:       disabled (set devloop.ntfyTopic to enable)\n'
+  fi
 
   if [[ "$implementer" == "$reviewer" ]]; then
     printf 'WARNING: implementer and reviewer backends are the same ("%s"); the review would not be independent.\n' "$implementer"
@@ -210,6 +238,7 @@ mark_needs_attention() {
   gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_ATTENTION" 2>/dev/null || true
   gh issue comment "$issue_number" --body "dev/devloop stopped: $reason" 2>/dev/null || true
   printf 'issue #%s needs attention: %s\n' "$issue_number" "$reason" >&2
+  notify "dev/devloop stopped" "issue #$issue_number: $reason"
 }
 
 # For when the implementer backend ran successfully but the worktree ended up with nothing to
@@ -264,6 +293,7 @@ run_one_cycle() {
     issue_number="$(pick_issue)" || die "failed to list issues"
     if [[ -z "$issue_number" ]]; then
       printf 'no open, unclaimed task issues found\n'
+      notify "dev/devloop stopped" "no open, unclaimed task issues found"
       return 1
     fi
     title="$(gh issue view "$issue_number" --json title -q .title)" ||
@@ -311,6 +341,7 @@ run_one_cycle() {
     local rc=0
     DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$implementer")" implement "$worktree" "$prompt_file" || rc=$?
     if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
+      notify "dev/devloop paused" "issue #$issue_number: $(cat "$(pause_marker)" 2>/dev/null || echo 'unknown reason')"
       return "$PAUSE_EXIT_CODE"
     elif [[ "$rc" -ne 0 ]]; then
       mark_needs_attention "$issue_number" "implementer backend '$implementer' failed"
@@ -368,6 +399,7 @@ Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit fa
     local rc=0
     DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$reviewer")" review "$pr_number" "$issue_number" || rc=$?
     if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
+      notify "dev/devloop paused" "issue #$issue_number: $(cat "$(pause_marker)" 2>/dev/null || echo 'unknown reason')"
       return "$PAUSE_EXIT_CODE"
     elif [[ "$rc" -ne 0 ]]; then
       mark_needs_attention "$issue_number" "reviewer backend '$reviewer' requested changes on PR #$pr_number"
