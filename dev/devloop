@@ -383,6 +383,10 @@ Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit fa
 
     gh pr merge "$pr_number" --squash --delete-branch ||
       { mark_needs_attention "$issue_number" "gh pr merge failed"; return 1; }
+    # The issue auto-closes via "Closes #<n>" in the PR body, but that doesn't clear the
+    # label devloop itself added — do it explicitly so a closed issue doesn't sit there
+    # looking like it's still in progress.
+    gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" 2>/dev/null || true
     git worktree remove "$worktree" --force 2>/dev/null || true
     rm -f "$state_dir/current" "$prompt_file"
     printf 'merged PR #%s for issue #%s\n' "$pr_number" "$issue_number"
