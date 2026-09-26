@@ -309,6 +309,476 @@ func TestRemoveMember(t *testing.T) {
 	})
 }
 
+func TestAddPreference(t *testing.T) {
+	t.Run("adds a preference to a member", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		added, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		preference, err := service.AddPreference(context.Background(), created.ID, added.ID, sql.NullInt16{}, "vegan", household.DietaryRestriction, household.Hard)
+
+		// make sure returned preference is valid and listing preferences returns int
+		if err != nil {
+			t.Fatalf("add preference: %v", err)
+		}
+		if preference.ID == "" {
+			t.Error("preference ID is empty")
+		}
+		if preference.HouseholdID != created.ID {
+			t.Errorf("household ID: got %q, want %q", preference.HouseholdID, created.ID)
+		}
+		if preference.MemberID != added.ID {
+			t.Errorf("member ID: got %q, want %q", preference.MemberID, added.ID)
+		}
+		if preference.Value != "vegan" {
+			t.Errorf("preference value: got %q, want %q", preference.Value, "vegan")
+		}
+		if preference.Category != household.DietaryRestriction {
+			t.Errorf("preference type: got %q, want %q", preference.Category, household.DietaryRestriction)
+		}
+		if preference.Kind != household.Hard {
+			t.Errorf("preference severity: got %q, want %q", preference.Kind, household.Hard)
+		}
+		if preference.Strength.Valid {
+			t.Errorf("preference strength: got %v, want null", preference.Strength)
+		}
+
+		// list preferences and make sure the added preference is returned
+		preferences, err := service.ListPreferences(context.Background(), created.ID, added.ID, household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 1 {
+			t.Fatalf("preference count: got %d, want 1", len(preferences))
+		}
+		listed := preferences[0]
+		if listed != preference {
+			t.Errorf("listed preference: got %+v, want %+v", listed, preference)
+		}
+
+	})
+
+	t.Run("adds a household-wide preference without a member", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		added, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+
+		preference, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard)
+		if err != nil {
+			t.Fatalf("add preference: %v", err)
+		}
+		if preference.MemberID != "" {
+			t.Errorf("member ID: got %q, want empty", preference.MemberID)
+		}
+
+		// A household-wide preference is visible to every member, not just the one who happens
+		// to be passed in when listing.
+		preferences, err := service.ListPreferences(context.Background(), created.ID, added.ID, household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 1 || preferences[0].ID != preference.ID {
+			t.Fatalf("preferences for member: got %+v, want only %+v", preferences, preference)
+		}
+	})
+
+	t.Run("rejects invalid input without creating a preference", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		added, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+
+		for _, test := range []struct {
+			name     string
+			strength sql.NullInt16
+			value    string
+			kind     household.PreferenceKind
+		}{
+			{name: "empty value", strength: sql.NullInt16{}, value: "  ", kind: household.Hard},
+			{name: "hard preference with a strength", strength: sql.NullInt16{Int16: 3, Valid: true}, value: "peanuts", kind: household.Hard},
+			{name: "soft preference without a strength", strength: sql.NullInt16{}, value: "spicy food", kind: household.Soft},
+			{name: "soft preference with an out-of-range strength", strength: sql.NullInt16{Int16: 6, Valid: true}, value: "spicy food", kind: household.Soft},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				_, err := service.AddPreference(context.Background(), created.ID, added.ID, test.strength, test.value, household.Dislike, test.kind)
+				if !errors.Is(err, household.ErrInvalidInput) {
+					t.Fatalf("error: got %v, want ErrInvalidInput", err)
+				}
+			})
+		}
+
+		preferences, err := service.ListPreferences(context.Background(), created.ID, added.ID, household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 0 {
+			t.Errorf("preferences: got %+v, want none", preferences)
+		}
+	})
+
+	t.Run("rejects an unknown member", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+
+		_, err = service.AddPreference(context.Background(), created.ID, "missing-member", sql.NullInt16{}, "vegan", household.DietaryRestriction, household.Hard)
+		if !errors.Is(err, household.ErrMemberNotFound) {
+			t.Fatalf("error: got %v, want ErrMemberNotFound", err)
+		}
+	})
+
+	t.Run("rejects an unknown household", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+
+		_, err := service.AddPreference(context.Background(), "missing-household", "", sql.NullInt16{}, "vegan", household.DietaryRestriction, household.Hard)
+		if !errors.Is(err, household.ErrHouseholdNotFound) {
+			t.Fatalf("error: got %v, want ErrHouseholdNotFound", err)
+		}
+	})
+}
+
+func TestListPreferences(t *testing.T) {
+	t.Run("lists a member's own and the household's preferences together", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		otherMember, err := service.AddMember(context.Background(), created.ID, "Other Member")
+		if err != nil {
+			t.Fatalf("add other member: %v", err)
+		}
+
+		householdWide, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard)
+		if err != nil {
+			t.Fatalf("add household preference: %v", err)
+		}
+		own, err := service.AddPreference(context.Background(), created.ID, member.ID, sql.NullInt16{Int16: 4, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		if err != nil {
+			t.Fatalf("add member preference: %v", err)
+		}
+		if _, err := service.AddPreference(context.Background(), created.ID, otherMember.ID, sql.NullInt16{Int16: 2, Valid: true}, "Thai", household.Cuisine, household.Soft); err != nil {
+			t.Fatalf("add other member preference: %v", err)
+		}
+
+		preferences, err := service.ListPreferences(context.Background(), created.ID, member.ID, household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		gotIDs := map[string]bool{}
+		for _, preference := range preferences {
+			gotIDs[preference.ID] = true
+		}
+		if len(preferences) != 2 || !gotIDs[householdWide.ID] || !gotIDs[own.ID] {
+			t.Fatalf("preferences for member: got %+v, want exactly %+v and %+v", preferences, householdWide, own)
+		}
+	})
+
+	t.Run("lists an empty slice for a member with no preferences", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+
+		preferences, err := service.ListPreferences(context.Background(), created.ID, member.ID, household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if preferences == nil || len(preferences) != 0 {
+			t.Errorf("preferences: got %#v, want non-nil empty slice", preferences)
+		}
+	})
+
+	t.Run("returns an empty slice for an unknown member", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		if _, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard); err != nil {
+			t.Fatalf("add household preference: %v", err)
+		}
+
+		// An unknown member still sees household-wide preferences, matching AddPreference's
+		// treatment of an empty member as "household-wide" rather than a member match failure.
+		preferences, err := service.ListPreferences(context.Background(), created.ID, "missing-member", household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 1 {
+			t.Errorf("preferences for unknown member: got %+v, want the household-wide preference only", preferences)
+		}
+	})
+
+	t.Run("returns an empty slice for an unknown household", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+
+		preferences, err := service.ListPreferences(context.Background(), "missing-household", "missing-member", household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if preferences == nil || len(preferences) != 0 {
+			t.Errorf("preferences: got %#v, want non-nil empty slice", preferences)
+		}
+	})
+
+	t.Run("filters by category", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		allergy, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard)
+		if err != nil {
+			t.Fatalf("add allergy preference: %v", err)
+		}
+		if _, err := service.AddPreference(context.Background(), created.ID, member.ID, sql.NullInt16{Int16: 4, Valid: true}, "Italian", household.Cuisine, household.Soft); err != nil {
+			t.Fatalf("add cuisine preference: %v", err)
+		}
+
+		preferences, err := service.ListPreferences(context.Background(), created.ID, member.ID, household.PreferenceFilter{Category: household.Allergy})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 1 || preferences[0].ID != allergy.ID {
+			t.Fatalf("preferences filtered by category: got %+v, want only %+v", preferences, allergy)
+		}
+	})
+
+	t.Run("filters by kind", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		if _, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard); err != nil {
+			t.Fatalf("add allergy preference: %v", err)
+		}
+		cuisine, err := service.AddPreference(context.Background(), created.ID, member.ID, sql.NullInt16{Int16: 4, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		if err != nil {
+			t.Fatalf("add cuisine preference: %v", err)
+		}
+
+		preferences, err := service.ListPreferences(context.Background(), created.ID, member.ID, household.PreferenceFilter{Kind: household.Soft})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 1 || preferences[0].ID != cuisine.ID {
+			t.Fatalf("preferences filtered by kind: got %+v, want only %+v", preferences, cuisine)
+		}
+	})
+
+	t.Run("combines category and kind filters", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		if _, err := service.AddPreference(context.Background(), created.ID, member.ID, sql.NullInt16{Int16: 3, Valid: true}, "Peanut oil", household.Cuisine, household.Soft); err != nil {
+			t.Fatalf("add soft cuisine preference: %v", err)
+		}
+		hardCuisine, err := service.AddPreference(context.Background(), created.ID, member.ID, sql.NullInt16{}, "no shellfish", household.Cuisine, household.Hard)
+		if err != nil {
+			t.Fatalf("add hard cuisine preference: %v", err)
+		}
+
+		preferences, err := service.ListPreferences(context.Background(), created.ID, member.ID, household.PreferenceFilter{Category: household.Cuisine, Kind: household.Hard})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 1 || preferences[0].ID != hardCuisine.ID {
+			t.Fatalf("preferences filtered by category and kind: got %+v, want only %+v", preferences, hardCuisine)
+		}
+	})
+
+	t.Run("lists only household-wide preferences when no member is given", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		householdWide, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard)
+		if err != nil {
+			t.Fatalf("add household preference: %v", err)
+		}
+		if _, err := service.AddPreference(context.Background(), created.ID, member.ID, sql.NullInt16{Int16: 4, Valid: true}, "Italian", household.Cuisine, household.Soft); err != nil {
+			t.Fatalf("add member preference: %v", err)
+		}
+
+		preferences, err := service.ListPreferences(context.Background(), created.ID, "", household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 1 || preferences[0].ID != householdWide.ID {
+			t.Fatalf("household-wide preferences: got %+v, want only %+v", preferences, householdWide)
+		}
+	})
+}
+
+func TestRemovePreference(t *testing.T) {
+	t.Run("removes a preference from a member", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+		preference, err := service.AddPreference(context.Background(), created.ID, member.ID, sql.NullInt16{Int16: 4, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		if err != nil {
+			t.Fatalf("add preference: %v", err)
+		}
+
+		if err := service.RemovePreference(context.Background(), created.ID, member.ID, preference.ID); err != nil {
+			t.Fatalf("remove preference: %v", err)
+		}
+		preferences, err := service.ListPreferences(context.Background(), created.ID, member.ID, household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 0 {
+			t.Errorf("preferences after removal: got %+v, want none", preferences)
+		}
+	})
+
+	t.Run("removes a preference from a household", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		preference, err := service.AddPreference(context.Background(), created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard)
+		if err != nil {
+			t.Fatalf("add preference: %v", err)
+		}
+
+		if err := service.RemovePreference(context.Background(), created.ID, "", preference.ID); err != nil {
+			t.Fatalf("remove preference: %v", err)
+		}
+		preferences, err := service.ListPreferences(context.Background(), created.ID, "", household.PreferenceFilter{})
+		if err != nil {
+			t.Fatalf("list preferences: %v", err)
+		}
+		if len(preferences) != 0 {
+			t.Errorf("preferences after removal: got %+v, want none", preferences)
+		}
+	})
+
+	t.Run("rejects an unknown preference", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		member, err := service.AddMember(context.Background(), created.ID, "Member")
+		if err != nil {
+			t.Fatalf("add member: %v", err)
+		}
+
+		err = service.RemovePreference(context.Background(), created.ID, member.ID, "missing-preference")
+		if !errors.Is(err, household.ErrPreferenceNotFound) {
+			t.Fatalf("error: got %v, want ErrPreferenceNotFound", err)
+		}
+	})
+
+	t.Run("rejects an unknown member", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, err := service.CreateHousehold(
+			context.Background(), "Household", "Australia/Sydney", "Founder",
+		)
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+
+		err = service.RemovePreference(context.Background(), created.ID, "missing-member", "missing-preference")
+		if !errors.Is(err, household.ErrMemberNotFound) {
+			t.Fatalf("error: got %v, want ErrMemberNotFound", err)
+		}
+	})
+
+	t.Run("rejects an unknown household", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+
+		err := service.RemovePreference(context.Background(), "missing-household", "", "missing-preference")
+		if !errors.Is(err, household.ErrHouseholdNotFound) {
+			t.Fatalf("error: got %v, want ErrHouseholdNotFound", err)
+		}
+	})
+}
+
 func memberWithID(members []household.Member, id string) (household.Member, bool) {
 	for _, member := range members {
 		if member.ID == id {
