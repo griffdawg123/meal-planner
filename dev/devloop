@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly GITHUB_REMOTE="origin"
+readonly LABEL_IN_PROGRESS="devloop:in-progress"
+readonly LABEL_NEEDS_ATTENTION="devloop:needs-attention"
+readonly PAUSE_EXIT_CODE=75
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dev/devloop doctor
+  dev/devloop init-labels
+  dev/devloop run [--once]
+
+Picks an open GitHub issue, delegates implementation and review to
+configured backends (dev/backends/<name>), and merges the result once
+tests and an independent review both pass. See docs/devloop-workflow.md.
+
+Configuration (local git config):
+  devloop.implementerBackend   default: claude
+  devloop.reviewerBackend      default: claude
+  orbWorkflow.testCommand      reused from dev/orb; required
+  orbWorkflow.baseBranch       reused from dev/orb; default: main
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+repository_root() {
+  git rev-parse --show-toplevel 2>/dev/null || die "run this command inside a Git repository"
+}
+
+state_directory() {
+  git rev-parse --git-path devloop-state
+}
+
+base_branch() {
+  git config --get orbWorkflow.baseBranch 2>/dev/null || printf 'main\n'
+}
+
+test_command() {
+  git config --get orbWorkflow.testCommand 2>/dev/null || true
+}
+
+backend_for() {
+  local role="$1" key=""
+  case "$role" in
+    implementer) key="devloop.implementerBackend" ;;
+    reviewer) key="devloop.reviewerBackend" ;;
+    *) die "unknown backend role: $role" ;;
+  esac
+  git config --get "$key" 2>/dev/null || printf 'claude\n'
+}
+
+backend_script() {
+  local name="$1" root
+  root="$(repository_root)"
+  [[ -x "$root/dev/backends/$name" ]] || die "no executable backend at dev/backends/$name"
+  printf '%s/dev/backends/%s\n' "$root" "$name"
+}
+
+pause_marker() {
+  printf '%s/paused\n' "$(state_directory)"
+}
+
+is_paused() {
+  [[ -f "$(pause_marker)" ]]
+}
+
+doctor() {
+  local implementer reviewer test_cmd
+
+  require_command git
+  require_command gh
+  require_command jq
+
+  implementer="$(backend_for implementer)"
+  reviewer="$(backend_for reviewer)"
+  test_cmd="$(test_command)"
+
+  printf 'GitHub remote:       %s\n' "$(git config --get "remote.$GITHUB_REMOTE.url" 2>/dev/null || echo 'not configured')"
+  printf 'Base branch:         %s\n' "$(base_branch)"
+  printf 'Implementer backend: %s\n' "$implementer"
+  printf 'Reviewer backend:    %s\n' "$reviewer"
+  printf 'Test command:        %s\n' "${test_cmd:-not configured (required before running)}"
+
+  if [[ "$implementer" == "$reviewer" ]]; then
+    printf 'WARNING: implementer and reviewer backends are the same ("%s"); the review would not be independent.\n' "$implementer"
+  fi
+
+  for name in "$implementer" "$reviewer"; do
+    if backend_script "$name" >/dev/null 2>&1; then
+      printf 'Backend %-10s ok (dev/backends/%s)\n' "$name" "$name"
+    else
+      printf 'Backend %-10s MISSING (expected dev/backends/%s)\n' "$name" "$name"
+    fi
+  done
+
+  if gh label list --json name 2>/dev/null | jq -e --arg l "$LABEL_IN_PROGRESS" 'any(.[]; .name == $l)' >/dev/null; then
+    printf 'Label %s: present\n' "$LABEL_IN_PROGRESS"
+  else
+    printf 'Label %s: missing (run dev/devloop init-labels)\n' "$LABEL_IN_PROGRESS"
+  fi
+  if gh label list --json name 2>/dev/null | jq -e --arg l "$LABEL_NEEDS_ATTENTION" 'any(.[]; .name == $l)' >/dev/null; then
+    printf 'Label %s: present\n' "$LABEL_NEEDS_ATTENTION"
+  else
+    printf 'Label %s: missing (run dev/devloop init-labels)\n' "$LABEL_NEEDS_ATTENTION"
+  fi
+
+  if is_paused; then
+    printf 'Loop state: PAUSED (%s)\n' "$(cat "$(pause_marker)")"
+  elif [[ -f "$(state_directory)/current" ]]; then
+    printf 'Loop state: mid-cycle, will resume: %s\n' "$(cat "$(state_directory)/current")"
+  else
+    printf 'Loop state: idle\n'
+  fi
+}
+
+init_labels() {
+  require_command gh
+  gh label create "$LABEL_IN_PROGRESS" --color FBCA04 \
+    --description "dev/devloop is actively working this issue" 2>/dev/null ||
+    printf 'label %s already exists\n' "$LABEL_IN_PROGRESS"
+  gh label create "$LABEL_NEEDS_ATTENTION" --color D93F0B \
+    --description "dev/devloop stopped on this issue and needs a human" 2>/dev/null ||
+    printf 'label %s already exists\n' "$LABEL_NEEDS_ATTENTION"
+}
+
+# Prints the next issue number to work, or nothing if there is none. Title
+# and body are fetched separately (not packed into this output) so that
+# multi-line issue bodies don't need TSV escaping/unescaping.
+pick_issue() {
+  gh issue list --state open --label task --json number,labels --limit 200 |
+    jq -r --arg ip "$LABEL_IN_PROGRESS" --arg na "$LABEL_NEEDS_ATTENTION" '
+      map(select(([.labels[].name] | index($ip) | not) and ([.labels[].name] | index($na) | not)))
+      | sort_by(.number)
+      | .[0].number // empty
+    '
+}
+
+parent_story_body() {
+  local issue_body="$1" parent_number
+  parent_number="$(printf '%s' "$issue_body" | grep -oE 'Parent story: #[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
+  [[ -n "$parent_number" ]] || return 0
+  gh issue view "$parent_number" --json body -q .body 2>/dev/null || true
+}
+
+build_prompt_file() {
+  local issue_number="$1" title="$2" body="$3" parent_number="$4" parent_body="$5" out="$6"
+
+  {
+    printf '# Task: implement GitHub issue #%s\n\n' "$issue_number"
+    printf '## %s\n\n%s\n\n' "$title" "$body"
+    if [[ -n "$parent_body" ]]; then
+      printf '## Parent story #%s (acceptance criteria context)\n\n%s\n\n' "$parent_number" "$parent_body"
+    fi
+    cat <<'EOF'
+## House rules for this repo
+
+- Write a failing test first, then implement until it passes. Do not skip
+  the failing-test step.
+- Go tests live in an external test package (e.g. `package household_test`),
+  use only the standard `testing` package (no testify), and use
+  `t.Fatalf`/`t.Errorf` with "got X, want Y" phrasing.
+- Prefer subtests via `t.Run("descriptive sentence", func(t *testing.T) {...})`.
+- Reuse existing test helpers (e.g. `newTestDatabase(t)`) instead of
+  duplicating setup; call `t.Helper()` in any new helper you add.
+- Some existing tests have empty stub `t.Run(...) {}` bodies marking
+  planned-but-unwritten cases. If one of those is in scope for this issue,
+  fill it in rather than assuming it's already covered.
+- Run `gofmt -l .` and `go vet ./...` yourself before finishing; both must
+  be clean.
+- Do not touch Git remotes, do not push, do not open a pull request, and do
+  not merge anything — the orchestrator handles all of that. Just leave the
+  working tree with a complete, tested change.
+- If you learn something about this repo's conventions that isn't already
+  documented in AGENTS.md, mention it explicitly in your final summary so it
+  can be considered for an AGENTS.md addition — do not edit AGENTS.md
+  yourself.
+EOF
+  } >"$out"
+}
+
+mark_needs_attention() {
+  local issue_number="$1" reason="$2"
+  gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_ATTENTION" 2>/dev/null || true
+  gh issue comment "$issue_number" --body "dev/devloop stopped: $reason" 2>/dev/null || true
+  printf 'issue #%s needs attention: %s\n' "$issue_number" "$reason" >&2
+}
+
+# Returns 0 (continue looping), 1 (stop looping, failure), or
+# $PAUSE_EXIT_CODE (stop looping, resume later).
+run_one_cycle() {
+  local state_dir issue_number title body parent_number parent_body phase
+  local worktree branch prompt_file implementer reviewer pr_number
+  local test_cmd root
+
+  root="$(repository_root)"
+  state_dir="$(state_directory)"
+  mkdir -p "$state_dir"
+
+  if is_paused; then
+    printf 'paused: %s\n' "$(cat "$(pause_marker)")" >&2
+    return "$PAUSE_EXIT_CODE"
+  fi
+
+  implementer="$(backend_for implementer)"
+  reviewer="$(backend_for reviewer)"
+  [[ "$implementer" != "$reviewer" ]] ||
+    die "implementer and reviewer backends must differ (both are '$implementer')"
+
+  test_cmd="$(test_command)"
+  [[ -n "$test_cmd" ]] || die "no test command configured; run: dev/orb configure-test '<command>'"
+
+  if [[ -f "$state_dir/current" ]]; then
+    # shellcheck disable=SC1090
+    source "$state_dir/current"
+  else
+    issue_number="$(pick_issue)"
+    if [[ -z "$issue_number" ]]; then
+      printf 'no open, unclaimed task issues found\n'
+      return 1
+    fi
+    title="$(gh issue view "$issue_number" --json title -q .title)"
+    body="$(gh issue view "$issue_number" --json body -q .body)"
+
+    parent_number="$(printf '%s' "$body" | grep -oE 'Parent story: #[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
+    parent_body="$(parent_story_body "$body")"
+
+    gh issue edit "$issue_number" --add-label "$LABEL_IN_PROGRESS"
+
+    branch="issue-$issue_number"
+    worktree="$root/../meal-planner-issue-$issue_number"
+    git fetch "$GITHUB_REMOTE" "$(base_branch)"
+    git worktree add "$worktree" -b "$branch" "$GITHUB_REMOTE/$(base_branch)"
+
+    prompt_file="$state_dir/prompt-$issue_number.md"
+    build_prompt_file "$issue_number" "$title" "$body" "$parent_number" "$parent_body" "$prompt_file"
+
+    pr_number=""
+    {
+      printf 'issue_number=%q\n' "$issue_number"
+      printf 'title=%q\n' "$title"
+      printf 'branch=%q\n' "$branch"
+      printf 'worktree=%q\n' "$worktree"
+      printf 'prompt_file=%q\n' "$prompt_file"
+      printf 'pr_number=%q\n' "$pr_number"
+      printf 'phase=%q\n' "implement"
+    } >"$state_dir/current"
+    phase="implement"
+  fi
+
+  if [[ "$phase" == "implement" ]]; then
+    printf 'implementing issue #%s on branch %s via %s\n' "$issue_number" "$branch" "$implementer"
+    local rc=0
+    DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$implementer")" implement "$worktree" "$prompt_file" || rc=$?
+    if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
+      return "$PAUSE_EXIT_CODE"
+    elif [[ "$rc" -ne 0 ]]; then
+      mark_needs_attention "$issue_number" "implementer backend '$implementer' failed"
+      rm -f "$state_dir/current"
+      return 1
+    fi
+
+    printf 'running local checks in %s\n' "$worktree"
+    local unformatted
+    unformatted="$(cd "$worktree" && gofmt -l .)"
+    if [[ -n "$unformatted" ]]; then
+      mark_needs_attention "$issue_number" "gofmt found unformatted files: $unformatted"
+      rm -f "$state_dir/current"
+      return 1
+    fi
+    if ! (cd "$worktree" && go vet ./...); then
+      mark_needs_attention "$issue_number" "go vet failed"
+      rm -f "$state_dir/current"
+      return 1
+    fi
+    if ! (cd "$worktree" && bash -lc "$test_cmd"); then
+      mark_needs_attention "$issue_number" "test command failed: $test_cmd"
+      rm -f "$state_dir/current"
+      return 1
+    fi
+
+    (cd "$worktree" && git add -A && git commit -m "$title
+
+Closes #$issue_number")
+    (cd "$worktree" && git push -u "$GITHUB_REMOTE" "$branch")
+    pr_number="$(cd "$worktree" && gh pr create --title "$title" --body "Closes #$issue_number" --base "$(base_branch)" --head "$branch" --json number -q .number)"
+
+    sed -i "s/^pr_number=.*/pr_number=$(printf '%q' "$pr_number")/" "$state_dir/current"
+    sed -i "s/^phase=.*/phase=review/" "$state_dir/current"
+    phase="review"
+  fi
+
+  if [[ "$phase" == "review" ]]; then
+    printf 'reviewing PR #%s via %s\n' "$pr_number" "$reviewer"
+    local rc=0
+    DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$reviewer")" review "$pr_number" "$issue_number" || rc=$?
+    if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
+      return "$PAUSE_EXIT_CODE"
+    elif [[ "$rc" -ne 0 ]]; then
+      mark_needs_attention "$issue_number" "reviewer backend '$reviewer' requested changes on PR #$pr_number"
+      rm -f "$state_dir/current"
+      return 1
+    fi
+
+    if ! gh pr checks "$pr_number" --watch; then
+      mark_needs_attention "$issue_number" "required PR checks are not green on PR #$pr_number"
+      rm -f "$state_dir/current"
+      return 1
+    fi
+
+    gh pr merge "$pr_number" --squash --delete-branch
+    git worktree remove "$worktree" --force 2>/dev/null || true
+    rm -f "$state_dir/current" "$prompt_file"
+    printf 'merged PR #%s for issue #%s\n' "$pr_number" "$issue_number"
+    return 0
+  fi
+}
+
+run_loop() {
+  local once=0
+  [[ "${1:-}" == "--once" ]] && once=1
+
+  while true; do
+    local rc=0
+    run_one_cycle || rc=$?
+    if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
+      exit "$PAUSE_EXIT_CODE"
+    elif [[ "$rc" -ne 0 ]]; then
+      exit 1
+    fi
+    [[ "$once" -eq 1 ]] && exit 0
+  done
+}
+
+main() {
+  local root command="${1:-}"
+
+  require_command git
+  root="$(repository_root)"
+  cd "$root"
+
+  case "$command" in
+    doctor) shift; [[ $# -eq 0 ]] || die "doctor takes no arguments"; doctor ;;
+    init-labels) shift; init_labels ;;
+    run) shift; run_loop "$@" ;;
+    help|-h|--help|'') usage ;;
+    *) usage >&2; die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

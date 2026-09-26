@@ -9,6 +9,9 @@ See [the MVP product specification](docs/product-spec.md) for the agreed scope a
 Development can be delegated to Amp orbs without giving them GitHub credentials. See the
 [local-to-orb development workflow](docs/orb-workflow.md).
 
+Issues can also be picked up, implemented, reviewed, and merged automatically. See the
+[automated dev loop](docs/devloop-workflow.md).
+
 ## Status
 
 Product definition. Implementation has not started.
