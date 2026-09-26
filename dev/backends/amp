@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+
+# Amp orb backend for dev/devloop. Implements the backend contract described in
+# docs/devloop-workflow.md:
+#
+#   dev/backends/amp implement <worktree-path> <prompt-file>
+#   dev/backends/amp review <pr-number> <issue-number>
+#
+# Exit codes: 0 = success, 1 = failed, 75 = paused (credits/quota exhausted; writes
+# $DEVLOOP_STATE_DIR/paused and leaves everything else untouched).
+#
+# implement dispatches to a real Amp orb via dev/orb (dev/orb start, then dev/orb sync once
+# the orb is done) because it needs a full checkout to edit files and run tests in — this is
+# genuinely async, unlike review below.
+#
+# review does NOT use an orb. It hands the PR diff and issue text to a synchronous, local
+# `amp -x` call (no repo checkout needed for a text review) and posts the result as a PR
+# comment itself, since an orb must never hold GitHub credentials (see AGENTS.md) and this
+# way it doesn't need any.
+
+set -euo pipefail
+
+readonly PAUSE_EXIT_CODE=75
+readonly EXHAUSTED_PATTERN='credit|quota exceeded|insufficient credits|rate limit exceeded|out of credits'
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+mark_paused() {
+  local detail="$1"
+  [[ -n "${DEVLOOP_STATE_DIR:-}" ]] || die "DEVLOOP_STATE_DIR must be set by the orchestrator"
+  mkdir -p "$DEVLOOP_STATE_DIR"
+  printf '%s: %s\n' "$(date -u +%FT%TZ)" "$detail" >"$DEVLOOP_STATE_DIR/paused"
+}
+
+# NOTE: like the claude backend's usage-limit pattern, this hasn't been confirmed against a
+# real exhausted-credits message — tighten it the first time this misses or misfires.
+looks_like_exhausted() {
+  grep -qiE "$EXHAUSTED_PATTERN" "$1"
+}
+
+# NOTE — UNVERIFIED: this was written without a live, authenticated `amp` session (amp login
+# had expired while building this), so the field/value below is a best guess about the shape
+# of `amp threads export`'s payload, not a confirmed fact. Before trusting dev/devloop's amp
+# backend for real, run `amp threads export <a-real-thread-id>` yourself, see what a finished
+# thread's payload actually looks like, and fix this function to match if it differs. Until
+# then this fails closed: if it can never confirm completion, implement() times out and asks
+# for a manual `dev/orb sync` rather than guessing and syncing a still-in-progress orb.
+orb_thread_is_done() {
+  local thread_id="$1" payload
+  payload="$(amp threads export "$thread_id" 2>/dev/null)" || return 1
+  printf '%s' "$payload" | jq -e '
+    ([.status, .state, .executionState] | map(select(. != null and . != "")) | .[0] // "") as $s
+    | ($s | ascii_downcase) as $s
+    | $s == "completed" or $s == "done" or $s == "idle" or $s == "finished" or $s == "succeeded"
+  ' >/dev/null 2>&1
+}
+
+implement() {
+  local worktree="$1" prompt_file="$2"
+  local dev_orb start_output thread_id
+  local timeout_seconds interval elapsed
+
+  [[ -d "$worktree" ]] || die "worktree not found: $worktree"
+  [[ -f "$prompt_file" ]] || die "prompt file not found: $prompt_file"
+  [[ -n "${DEVLOOP_STATE_DIR:-}" ]] || die "DEVLOOP_STATE_DIR must be set by the orchestrator"
+  require_command amp
+  require_command jq
+
+  dev_orb="$worktree/dev/orb"
+  [[ -x "$dev_orb" ]] || die "dev/orb not found or not executable in $worktree"
+
+  set +e
+  start_output="$(cd "$worktree" && "$dev_orb" start "$(cat "$prompt_file")" 2>&1)"
+  local rc=$?
+  set -e
+  printf '%s\n' "$start_output"
+
+  if looks_like_exhausted <(printf '%s' "$start_output"); then
+    mark_paused "implement backend (dev/orb start) reported exhausted credits/quota"
+    exit "$PAUSE_EXIT_CODE"
+  fi
+  [[ "$rc" -eq 0 ]] || exit 1
+
+  thread_id="$(printf '%s' "$start_output" | grep -Eo 'T-[[:alnum:]-]+' | tail -n1)"
+  [[ -n "$thread_id" ]] || die "could not read an Amp thread ID from dev/orb start output"
+
+  timeout_seconds="${DEVLOOP_AMP_TIMEOUT_SECONDS:-2700}"
+  interval=30
+  elapsed=0
+  while (( elapsed < timeout_seconds )); do
+    if orb_thread_is_done "$thread_id"; then
+      break
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+  if (( elapsed >= timeout_seconds )); then
+    die "orb thread $thread_id did not report completion within ${timeout_seconds}s (see the UNVERIFIED note on orb_thread_is_done above — this may be a detection bug, not a stuck orb); sync it manually once you've confirmed it's done: (cd $worktree && dev/orb sync $thread_id)"
+  fi
+
+  (cd "$worktree" && "$dev_orb" sync "$thread_id")
+}
+
+review() {
+  local pr_number="$1" issue_number="$2"
+  local diff issue_title issue_body prompt output rc
+
+  require_command gh
+  require_command amp
+
+  diff="$(gh pr diff "$pr_number")" || die "could not fetch diff for PR #$pr_number"
+  issue_title="$(gh issue view "$issue_number" --json title -q .title 2>/dev/null || true)"
+  issue_body="$(gh issue view "$issue_number" --json body -q .body 2>/dev/null || true)"
+
+  prompt="$(cat <<EOF
+Review this pull request against the GitHub issue it claims to close. Look for
+bugs and for places the implementation doesn't actually satisfy the issue,
+not just style.
+
+## Issue #$issue_number: $issue_title
+
+$issue_body
+
+## Diff
+
+\`\`\`diff
+$diff
+\`\`\`
+
+End your response with exactly one line, verbatim, and nothing after it:
+DEVLOOP_VERDICT: PASS
+or
+DEVLOOP_VERDICT: CHANGES_REQUESTED
+EOF
+)"
+
+  set +e
+  output="$(amp --no-color -x "$prompt" 2>&1)"
+  rc=$?
+  set -e
+
+  if looks_like_exhausted <(printf '%s' "$output"); then
+    mark_paused "review backend reported exhausted credits/quota"
+    exit "$PAUSE_EXIT_CODE"
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$output"
+  gh pr comment "$pr_number" --body "$output" >/dev/null
+
+  if printf '%s' "$output" | grep -q 'DEVLOOP_VERDICT: *PASS'; then
+    exit 0
+  else
+    exit 1
+  fi
+}
+
+main() {
+  local command="${1:-}"
+  case "$command" in
+    implement) shift; [[ $# -eq 2 ]] || die "usage: implement <worktree-path> <prompt-file>"; implement "$@" ;;
+    review) shift; [[ $# -eq 2 ]] || die "usage: review <pr-number> <issue-number>"; review "$@" ;;
+    *) die "usage: $0 implement <worktree-path> <prompt-file> | review <pr-number> <issue-number>" ;;
+  esac
+}
+
+main "$@"
