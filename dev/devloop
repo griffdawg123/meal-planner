@@ -5,6 +5,7 @@ set -euo pipefail
 readonly GITHUB_REMOTE="origin"
 readonly LABEL_IN_PROGRESS="devloop:in-progress"
 readonly LABEL_NEEDS_ATTENTION="devloop:needs-attention"
+readonly LABEL_NO_CHANGES_NEEDED="devloop:no-changes-needed"
 readonly PAUSE_EXIT_CODE=75
 
 usage() {
@@ -109,16 +110,13 @@ doctor() {
     fi
   done
 
-  if gh label list --json name 2>/dev/null | jq -e --arg l "$LABEL_IN_PROGRESS" 'any(.[]; .name == $l)' >/dev/null; then
-    printf 'Label %s: present\n' "$LABEL_IN_PROGRESS"
-  else
-    printf 'Label %s: missing (run dev/devloop init-labels)\n' "$LABEL_IN_PROGRESS"
-  fi
-  if gh label list --json name 2>/dev/null | jq -e --arg l "$LABEL_NEEDS_ATTENTION" 'any(.[]; .name == $l)' >/dev/null; then
-    printf 'Label %s: present\n' "$LABEL_NEEDS_ATTENTION"
-  else
-    printf 'Label %s: missing (run dev/devloop init-labels)\n' "$LABEL_NEEDS_ATTENTION"
-  fi
+  for label in "$LABEL_IN_PROGRESS" "$LABEL_NEEDS_ATTENTION" "$LABEL_NO_CHANGES_NEEDED"; do
+    if gh label list --json name 2>/dev/null | jq -e --arg l "$label" 'any(.[]; .name == $l)' >/dev/null; then
+      printf 'Label %s: present\n' "$label"
+    else
+      printf 'Label %s: missing (run dev/devloop init-labels)\n' "$label"
+    fi
+  done
 
   if is_paused; then
     printf 'Loop state: PAUSED (%s)\n' "$(cat "$(pause_marker)")"
@@ -132,7 +130,7 @@ doctor() {
 require_labels() {
   local names
   names="$(gh label list --json name -q '.[].name' 2>/dev/null)" || die "could not list repo labels"
-  for label in "$LABEL_IN_PROGRESS" "$LABEL_NEEDS_ATTENTION"; do
+  for label in "$LABEL_IN_PROGRESS" "$LABEL_NEEDS_ATTENTION" "$LABEL_NO_CHANGES_NEEDED"; do
     grep -qxF "$label" <<<"$names" || die "label '$label' does not exist; run: dev/devloop init-labels"
   done
 }
@@ -145,6 +143,9 @@ init_labels() {
   gh label create "$LABEL_NEEDS_ATTENTION" --color D93F0B \
     --description "dev/devloop stopped on this issue and needs a human" 2>/dev/null ||
     printf 'label %s already exists\n' "$LABEL_NEEDS_ATTENTION"
+  gh label create "$LABEL_NO_CHANGES_NEEDED" --color BFD4F2 \
+    --description "the implementer found this issue already satisfied and made no changes" 2>/dev/null ||
+    printf 'label %s already exists\n' "$LABEL_NO_CHANGES_NEEDED"
 }
 
 # Prints the next issue number to work, or nothing if there is none. Title
@@ -152,8 +153,10 @@ init_labels() {
 # multi-line issue bodies don't need TSV escaping/unescaping.
 pick_issue() {
   gh issue list --state open --label task --json number,labels --limit 200 |
-    jq -r --arg ip "$LABEL_IN_PROGRESS" --arg na "$LABEL_NEEDS_ATTENTION" '
-      map(select(([.labels[].name] | index($ip) | not) and ([.labels[].name] | index($na) | not)))
+    jq -r --arg ip "$LABEL_IN_PROGRESS" --arg na "$LABEL_NEEDS_ATTENTION" --arg nc "$LABEL_NO_CHANGES_NEEDED" '
+      map(select(([.labels[].name] | index($ip) | not)
+        and ([.labels[].name] | index($na) | not)
+        and ([.labels[].name] | index($nc) | not)))
       | sort_by(.number)
       | .[0].number // empty
     '
@@ -207,6 +210,17 @@ mark_needs_attention() {
   gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_ATTENTION" 2>/dev/null || true
   gh issue comment "$issue_number" --body "dev/devloop stopped: $reason" 2>/dev/null || true
   printf 'issue #%s needs attention: %s\n' "$issue_number" "$reason" >&2
+}
+
+# For when the implementer backend ran successfully but the worktree ended up with nothing to
+# commit — the issue turned out to already be satisfied by existing code (e.g. an earlier
+# issue's work covered it too). This is not a failure: it doesn't stop the loop, and it uses
+# its own label rather than devloop:needs-attention so it doesn't read as "something's broken."
+mark_no_changes_needed() {
+  local issue_number="$1"
+  gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NO_CHANGES_NEEDED" 2>/dev/null || true
+  gh issue comment "$issue_number" --body "dev/devloop: the implementer backend made no changes — this issue appears to already be satisfied by existing code. Left open with no PR for a human to confirm and close (or dispute)." 2>/dev/null || true
+  printf 'issue #%s needed no changes\n' "$issue_number"
 }
 
 # Returns 0 (continue looping), 1 (stop looping, failure), or
@@ -319,6 +333,13 @@ run_one_cycle() {
       mark_needs_attention "$issue_number" "test command failed: $test_cmd"
       rm -f "$state_dir/current"
       return 1
+    fi
+
+    if [[ -z "$(cd "$worktree" && git status --porcelain)" ]]; then
+      mark_no_changes_needed "$issue_number"
+      git worktree remove "$worktree" --force 2>/dev/null || true
+      rm -f "$state_dir/current" "$prompt_file"
+      return 0
     fi
 
     (cd "$worktree" && git add -A && git commit -m "$title
