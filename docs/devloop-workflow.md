@@ -44,9 +44,10 @@ dev/devloop run --once    # do a single issue and stop
 ## What one cycle does
 
 1. Picks the lowest-numbered open `task` issue that isn't already labeled
-   `devloop:in-progress` or `devloop:needs-attention`. If the issue body
-   references `Parent story: #N`, fetches that story's body too (acceptance
-   criteria usually live there, not on the task).
+   `devloop:in-progress`, `devloop:needs-attention`, or
+   `devloop:no-changes-needed`. If the issue body references
+   `Parent story: #N`, fetches that story's body too (acceptance criteria
+   usually live there, not on the task).
 2. Labels the issue `devloop:in-progress`, creates
    `../meal-planner-issue-<n>` as a fresh worktree/branch off the base
    branch (mirrors the concurrent-orb pattern in `docs/orb-workflow.md`).
@@ -57,10 +58,15 @@ dev/devloop run --once    # do a single issue and stop
    worktree. Any failure here — or a non-zero implementer exit — labels the
    issue `devloop:needs-attention`, leaves the worktree for inspection, and
    **stops the loop** (no unattended retries).
-5. Commits, pushes the branch, opens the PR with `Closes #<n>`.
-6. Dispatches the reviewer backend against the PR. A non-zero exit (findings
+5. If the implementer backend succeeded but left the worktree with nothing
+   to commit, the issue is already satisfied by existing code (commonly:
+   another issue's work covered it too). Labels it
+   `devloop:no-changes-needed`, comments why, and **closes it directly** —
+   this doesn't stop the loop, it moves on to the next issue.
+6. Otherwise commits, pushes the branch, opens the PR with `Closes #<n>`.
+7. Dispatches the reviewer backend against the PR. A non-zero exit (findings
    reported) does the same needs-attention-and-stop as step 4.
-7. If every PR check is green too (`gh pr checks --watch`, not `--required` —
+8. If every PR check is green too (`gh pr checks --watch`, not `--required` —
    `main` isn't branch-protected yet, and `--required` would silently see
    zero required checks and pass trivially), merges (`--squash
    --delete-branch`), removes the worktree, and moves to the next issue.
