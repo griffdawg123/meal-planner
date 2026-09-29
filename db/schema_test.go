@@ -89,6 +89,121 @@ func TestPreferenceSchema(t *testing.T) {
 	}
 }
 
+func TestAwayNightSchema(t *testing.T) {
+	t.Run("records the nights a member is away", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		insertAwayNight(t, database, "household-1", "member-1", "2026-10-06")
+		insertAwayNight(t, database, "household-1", "member-1", "2026-10-08")
+
+		rows, err := database.Query(
+			`SELECT night FROM away_night WHERE household_id = ? AND member_id = ? ORDER BY night`,
+			"household-1", "member-1",
+		)
+		if err != nil {
+			t.Fatalf("query away nights: %v", err)
+		}
+		defer rows.Close()
+
+		var nights []string
+		for rows.Next() {
+			var night string
+			if err := rows.Scan(&night); err != nil {
+				t.Fatalf("scan away night: %v", err)
+			}
+			nights = append(nights, night)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate away nights: %v", err)
+		}
+		if len(nights) != 2 || nights[0] != "2026-10-06" || nights[1] != "2026-10-08" {
+			t.Fatalf("away nights: got %q, want %q", nights, []string{"2026-10-06", "2026-10-08"})
+		}
+	})
+
+	t.Run("rejects recording the same member away twice on one night", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertAwayNight(t, database, "household-1", "member-1", "2026-10-06")
+
+		if _, err := database.Exec(
+			`INSERT INTO away_night (household_id, member_id, night) VALUES (?, ?, ?)`,
+			"household-1", "member-1", "2026-10-06",
+		); err == nil {
+			t.Fatal("insert accepted a duplicate away night for the same member")
+		}
+	})
+
+	t.Run("rejects an away night for a member of another household", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertHousehold(t, database, "household-2", "member-2")
+
+		if _, err := database.Exec(
+			`INSERT INTO away_night (household_id, member_id, night) VALUES (?, ?, ?)`,
+			"household-1", "member-2", "2026-10-06",
+		); err == nil {
+			t.Fatal("insert accepted an away night for a member belonging to another household")
+		}
+	})
+
+	t.Run("rejects nights that are not calendar dates", func(t *testing.T) {
+		for _, night := range []string{"", "Tuesday", "2026-10-6", "2026-02-30", "2026-10-06T18:00:00", " 2026-10-06"} {
+			database := newTestDatabase(t)
+			insertHousehold(t, database, "household-1", "member-1")
+
+			if _, err := database.Exec(
+				`INSERT INTO away_night (household_id, member_id, night) VALUES (?, ?, ?)`,
+				"household-1", "member-1", night,
+			); err == nil {
+				t.Errorf("insert accepted away night %q, want rejection", night)
+			}
+		}
+	})
+
+	t.Run("marking a member present again removes only that night", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertAwayNight(t, database, "household-1", "member-1", "2026-10-06")
+		insertAwayNight(t, database, "household-1", "member-1", "2026-10-07")
+
+		if _, err := database.Exec(
+			`DELETE FROM away_night WHERE member_id = ? AND night = ?`, "member-1", "2026-10-06",
+		); err != nil {
+			t.Fatalf("delete away night: %v", err)
+		}
+
+		var remaining string
+		if err := database.QueryRow(
+			`SELECT group_concat(night) FROM away_night WHERE member_id = ?`, "member-1",
+		).Scan(&remaining); err != nil {
+			t.Fatalf("read remaining away nights: %v", err)
+		}
+		if remaining != "2026-10-07" {
+			t.Fatalf("remaining away nights: got %q, want %q", remaining, "2026-10-07")
+		}
+	})
+
+	t.Run("deleting a household cascades to its away nights", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertAwayNight(t, database, "household-1", "member-1", "2026-10-06")
+
+		if _, err := database.Exec(`DELETE FROM household WHERE id = ?`, "household-1"); err != nil {
+			t.Fatalf("delete household: %v", err)
+		}
+
+		var awayNights int
+		if err := database.QueryRow(`SELECT count(*) FROM away_night`).Scan(&awayNights); err != nil {
+			t.Fatalf("count away nights: %v", err)
+		}
+		if awayNights != 0 {
+			t.Fatalf("away nights remaining after household deletion: got %d, want 0", awayNights)
+		}
+	})
+}
+
 func TestApplySchemaCanBeReapplied(t *testing.T) {
 	database := newTestDatabase(t)
 	insertHousehold(t, database, "household-1", "member-1")
@@ -184,5 +299,16 @@ func insertHousehold(t *testing.T, database *sql.DB, householdID, memberID strin
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit household creation: %v", err)
+	}
+}
+
+func insertAwayNight(t *testing.T, database *sql.DB, householdID, memberID, night string) {
+	t.Helper()
+
+	if _, err := database.Exec(
+		`INSERT INTO away_night (household_id, member_id, night) VALUES (?, ?, ?)`,
+		householdID, memberID, night,
+	); err != nil {
+		t.Fatalf("insert away night %s for %s: %v", night, memberID, err)
 	}
 }
