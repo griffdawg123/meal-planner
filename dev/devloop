@@ -9,6 +9,10 @@ readonly LABEL_NO_CHANGES_NEEDED="devloop:no-changes-needed"
 readonly PAUSE_EXIT_CODE=75
 readonly PR_CREATE_ATTEMPTS=3
 readonly PR_HEAD_ATTEMPTS=8
+# A network or GitHub-side failure that outlasted retry(): the resume state is kept and the next
+# run carries on from the same phase. Backends use it too (see docs/devloop-workflow.md).
+readonly TRANSIENT_EXIT_CODE=69
+readonly NET_ATTEMPTS=5
 
 usage() {
   cat <<'EOF'
@@ -161,7 +165,7 @@ doctor() {
 
 require_labels() {
   local names
-  names="$(gh label list --json name -q '.[].name' 2>/dev/null)" || die "could not list repo labels"
+  names="$(retry gh label list --json name -q '.[].name' 2>/dev/null)" || die "could not list repo labels"
   for label in "$LABEL_IN_PROGRESS" "$LABEL_NEEDS_ATTENTION" "$LABEL_NO_CHANGES_NEEDED"; do
     grep -qxF "$label" <<<"$names" || die "label '$label' does not exist; run: dev/devloop init-labels"
   done
@@ -184,8 +188,9 @@ init_labels() {
 # and body are fetched separately (not packed into this output) so that
 # multi-line issue bodies don't need TSV escaping/unescaping.
 pick_issue() {
-  gh issue list --state open --label task --json number,labels --limit 200 |
-    jq -r --arg ip "$LABEL_IN_PROGRESS" --arg na "$LABEL_NEEDS_ATTENTION" --arg nc "$LABEL_NO_CHANGES_NEEDED" '
+  local issues
+  issues="$(retry gh issue list --state open --label task --json number,labels --limit 200)" || return 1
+  jq -r --arg ip "$LABEL_IN_PROGRESS" --arg na "$LABEL_NEEDS_ATTENTION" --arg nc "$LABEL_NO_CHANGES_NEEDED" <<<"$issues" '
       map(select(([.labels[].name] | index($ip) | not)
         and ([.labels[].name] | index($na) | not)
         and ([.labels[].name] | index($nc) | not)))
@@ -198,7 +203,7 @@ parent_story_body() {
   local issue_body="$1" parent_number
   parent_number="$(printf '%s' "$issue_body" | grep -oE 'Parent story: #[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
   [[ -n "$parent_number" ]] || return 0
-  gh issue view "$parent_number" --json body -q .body 2>/dev/null || true
+  retry gh issue view "$parent_number" --json body -q .body 2>/dev/null || true
 }
 
 build_prompt_file() {
@@ -237,10 +242,66 @@ EOF
   } >"$out"
 }
 
+# Runs a network command (git fetch/push, gh) up to NET_ATTEMPTS times, waiting a little longer
+# after each failure, so a dropped connection or a GitHub 5xx doesn't end the cycle. Only for
+# commands that are safe to repeat.
+retry() {
+  local attempt delay="${DEVLOOP_RETRY_DELAY_SECONDS:-15}"
+  for ((attempt = 1; ; attempt++)); do
+    "$@" && return 0
+    (( attempt < NET_ATTEMPTS )) || return 1
+    printf 'attempt %s of %s failed, retrying in %ss: %s\n' "$attempt" "$NET_ATTEMPTS" "$((delay * attempt))" "$*" >&2
+    sleep "$((delay * attempt))"
+  done
+}
+
+# For failures that are the network's or GitHub's fault rather than the change's: the issue's
+# labels, worktree, and resume state are left exactly as they are, so the next run (or run_loop's
+# own back-off) carries on from the same phase. Callers return TRANSIENT_EXIT_CODE after it.
+interrupted() {
+  printf 'interrupted, will resume: %s\n' "$1" >&2
+}
+
+# Classifies a PR's statusCheckRollup as ok, failed, pending, or none. Check runs report status and
+# conclusion; commit statuses report only state.
+readonly CHECKS_VERDICT_JQ='
+  [.statusCheckRollup[]
+    | (.conclusion // .state // "") as $result
+    | (.status // "COMPLETED") as $status
+    | if $status != "COMPLETED" or ($result | IN("", "PENDING", "EXPECTED")) then "pending"
+      elif ($result | IN("SUCCESS", "NEUTRAL", "SKIPPED")) then "ok"
+      else "failed" end]
+  | if length == 0 then "none"
+    elif any(. == "failed") then "failed"
+    elif any(. == "pending") then "pending"
+    else "ok" end'
+
+# Waits for a PR's checks to finish: 0 if they all passed, 1 if any failed, TRANSIENT_EXIT_CODE if
+# they're still pending (or couldn't be read) when the wait runs out. Replaces `gh pr checks
+# --watch`, whose exit status is the same for a failing check and a dropped connection — that once
+# flagged #62 needs-attention while its CI was green.
+wait_for_checks() {
+  local pr_number="$1" poll verdict
+  local interval="${DEVLOOP_CHECKS_POLL_SECONDS:-20}" polls="${DEVLOOP_CHECKS_MAX_POLLS:-90}"
+
+  for ((poll = 1; poll <= polls; poll++)); do
+    verdict="$(gh pr view "$pr_number" --json statusCheckRollup --jq "$CHECKS_VERDICT_JQ" 2>/dev/null || printf 'unreadable\n')"
+    case "$verdict" in
+      ok) return 0 ;;
+      failed) return 1 ;;
+    esac
+    if (( poll < polls )); then
+      printf 'PR #%s checks: %s; checking again in %ss\n' "$pr_number" "$verdict" "$interval" >&2
+      sleep "$interval"
+    fi
+  done
+  return "$TRANSIENT_EXIT_CODE"
+}
+
 mark_needs_attention() {
   local issue_number="$1" reason="$2"
-  gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_ATTENTION" 2>/dev/null || true
-  gh issue comment "$issue_number" --body "dev/devloop stopped: $reason" 2>/dev/null || true
+  retry gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_ATTENTION" 2>/dev/null || true
+  retry gh issue comment "$issue_number" --body "dev/devloop stopped: $reason" 2>/dev/null || true
   printf 'issue #%s needs attention: %s\n' "$issue_number" "$reason" >&2
   notify "dev/devloop stopped" "issue #$issue_number: $reason"
 }
@@ -252,9 +313,9 @@ mark_needs_attention() {
 # actually need a human to look at something.
 mark_no_changes_needed() {
   local issue_number="$1"
-  gh issue comment "$issue_number" --body "dev/devloop: the implementer backend made no changes — this issue already appears to be satisfied by existing code. Closing without a PR." 2>/dev/null || true
-  gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NO_CHANGES_NEEDED" 2>/dev/null || true
-  gh issue close "$issue_number" 2>/dev/null || true
+  retry gh issue comment "$issue_number" --body "dev/devloop: the implementer backend made no changes — this issue already appears to be satisfied by existing code. Closing without a PR." 2>/dev/null || true
+  retry gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NO_CHANGES_NEEDED" 2>/dev/null || true
+  retry gh issue close "$issue_number" 2>/dev/null || true
   printf 'issue #%s needed no changes; closed\n' "$issue_number"
 }
 
@@ -382,8 +443,13 @@ EOF
   } >"$out"
 }
 
-# Returns 0 (continue looping), 1 (stop looping, failure), or
-# $PAUSE_EXIT_CODE (stop looping, resume later).
+# Returns 0 (continue looping), 1 (stop looping, failure), $PAUSE_EXIT_CODE (stop looping, resume
+# after a usage limit resets), or $TRANSIENT_EXIT_CODE (network or GitHub trouble; resume soon).
+#
+# The cycle is a sequence of phases — setup, implement, publish, review ⇄ fix, merge — and the
+# phase is written to the resume state before its work starts. Every phase is safe to re-run from
+# the top, so however a run ends (killed, paused, interrupted), the next one resumes where it
+# stopped without redoing finished work or misreading it.
 #
 # IMPORTANT for anyone editing this function: it is always called as
 # `run_one_cycle || rc=$?` (see run_loop), and in bash that disables `set -e` for this
@@ -395,7 +461,7 @@ EOF
 run_one_cycle() {
   local state_dir issue_number title body parent_number parent_body phase
   local worktree branch prompt_file implementer reviewer pr_number fix_round
-  local test_cmd root max_rounds feedback_file fix_prompt_file rc pushed_head
+  local test_cmd root max_rounds feedback_file fix_prompt_file rc pushed_head message
 
   root="$(repository_root)"
   state_dir="$(state_directory)"
@@ -419,95 +485,137 @@ run_one_cycle() {
     # shellcheck disable=SC1090
     source "$state_dir/current"
   else
-    issue_number="$(pick_issue)" || die "failed to list issues"
+    # Nothing is claimed until the label below is added, so a failure before then just means
+    # "try again later" — there is nothing to roll back.
+    issue_number="$(pick_issue)" ||
+      { interrupted "could not list issues"; return "$TRANSIENT_EXIT_CODE"; }
     if [[ -z "$issue_number" ]]; then
       printf 'no open, unclaimed task issues found\n'
       notify "dev/devloop stopped" "no open, unclaimed task issues found"
       return 1
     fi
-    title="$(gh issue view "$issue_number" --json title -q .title)" ||
-      die "failed to read issue #$issue_number"
-    body="$(gh issue view "$issue_number" --json body -q .body)" ||
-      die "failed to read issue #$issue_number"
-
+    title="$(retry gh issue view "$issue_number" --json title -q .title)" ||
+      { interrupted "could not read issue #$issue_number"; return "$TRANSIENT_EXIT_CODE"; }
+    body="$(retry gh issue view "$issue_number" --json body -q .body)" ||
+      { interrupted "could not read issue #$issue_number"; return "$TRANSIENT_EXIT_CODE"; }
     parent_number="$(printf '%s' "$body" | grep -oE 'Parent story: #[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
     parent_body="$(parent_story_body "$body")"
 
-    # Nothing has been claimed yet, so a failure here is a plain die rather than
-    # mark_needs_attention — there is nothing to roll back or label.
-    gh issue edit "$issue_number" --add-label "$LABEL_IN_PROGRESS" ||
-      die "failed to label issue #$issue_number as $LABEL_IN_PROGRESS"
-
-    # The issue is claimed as of the line above, so every failure from here on must go
-    # through mark_needs_attention rather than die, or the issue is left labeled
-    # in-progress forever with nothing actually happening.
-    branch="issue-$issue_number"
-    worktree="$root/../meal-planner-issue-$issue_number"
-    git fetch "$GITHUB_REMOTE" "$(base_branch)" ||
-      { mark_needs_attention "$issue_number" "git fetch failed"; return 1; }
-    git worktree add "$worktree" -b "$branch" "$GITHUB_REMOTE/$(base_branch)" ||
-      { mark_needs_attention "$issue_number" "git worktree add failed"; return 1; }
-
     prompt_file="$state_dir/prompt-$issue_number.md"
     build_prompt_file "$issue_number" "$title" "$body" "$parent_number" "$parent_body" "$prompt_file" ||
-      { mark_needs_attention "$issue_number" "failed to write the prompt file"; return 1; }
+      die "failed to write the prompt file for issue #$issue_number"
 
+    branch="issue-$issue_number"
+    worktree="$root/../meal-planner-issue-$issue_number"
     pr_number=""
     fix_round=0
-    phase="implement"
+    phase="setup"
+
+    retry gh issue edit "$issue_number" --add-label "$LABEL_IN_PROGRESS" ||
+      { interrupted "could not label issue #$issue_number as $LABEL_IN_PROGRESS"; return "$TRANSIENT_EXIT_CODE"; }
+    # The issue is claimed as of the line above. Record that straight away: an issue labeled
+    # in-progress with no resume state is skipped by pick_issue and never picked up again.
     write_state "$state_dir/current" ||
       { mark_needs_attention "$issue_number" "failed to write loop state"; return 1; }
   fi
   # State files written before fix rounds existed have no fix_round line.
   fix_round="${fix_round:-0}"
-
-  if [[ "$phase" == "implement" ]]; then
-    printf 'implementing issue #%s on branch %s via %s\n' "$issue_number" "$branch" "$implementer"
-    rc=0
-    DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$implementer")" implement "$worktree" "$prompt_file" || rc=$?
-    if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
-      notify "dev/devloop paused" "issue #$issue_number: $(cat "$(pause_marker)" 2>/dev/null || echo 'unknown reason')"
-      return "$PAUSE_EXIT_CODE"
-    elif [[ "$rc" -ne 0 ]]; then
-      mark_needs_attention "$issue_number" "implementer backend '$implementer' failed"
-      rm -f "$state_dir/current"
-      return 1
-    fi
-
-    run_local_checks "$issue_number" "$worktree" "$test_cmd" ||
-      { rm -f "$state_dir/current"; return 1; }
-
-    if [[ -z "$(cd "$worktree" && git status --porcelain)" ]]; then
-      mark_no_changes_needed "$issue_number"
-      git worktree remove "$worktree" --force 2>/dev/null || true
-      rm -f "$state_dir/current" "$prompt_file"
-      return 0
-    fi
-
-    (cd "$worktree" && git add -A && git commit -m "$title
-
-Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit failed"; rm -f "$state_dir/current"; return 1; }
-    (cd "$worktree" && git push -u "$GITHUB_REMOTE" "$branch") ||
-      { mark_needs_attention "$issue_number" "git push failed"; rm -f "$state_dir/current"; return 1; }
-    pr_number="$(open_pr "$worktree" "$branch" "$title" "$issue_number")" ||
-      { mark_needs_attention "$issue_number" "could not open a PR for branch $branch after $PR_CREATE_ATTEMPTS attempts (the branch is pushed; open the PR by hand)"; rm -f "$state_dir/current"; return 1; }
-
-    phase="review"
-    write_state "$state_dir/current" ||
-      die "failed to advance state to the review phase"
-  fi
-
-  # review and fix alternate until the reviewer passes or max_rounds fix rounds are used
-  # up. Every transition is written to state before acting on it, so a pause (or a crash)
-  # in either phase resumes exactly where it left off on the next `dev/devloop run`.
   fix_prompt_file="$state_dir/fix-prompt-$issue_number.md"
+
   while true; do
     case "$phase" in
+      setup)
+        retry git fetch "$GITHUB_REMOTE" "$(base_branch)" ||
+          { interrupted "git fetch failed"; return "$TRANSIENT_EXIT_CODE"; }
+        if [[ ! -d "$worktree" ]]; then
+          if git show-ref --verify --quiet "refs/heads/$branch"; then
+            git worktree add "$worktree" "$branch"
+          else
+            git worktree add "$worktree" -b "$branch" "$GITHUB_REMOTE/$(base_branch)"
+          fi || { mark_needs_attention "$issue_number" "git worktree add failed"; rm -f "$state_dir/current"; return 1; }
+        fi
+        phase="implement"
+        write_state "$state_dir/current" || die "failed to advance state to the implement phase"
+        ;;
+
+      implement|fix)
+        if [[ "$phase" == "implement" ]]; then
+          printf 'implementing issue #%s on branch %s via %s\n' "$issue_number" "$branch" "$implementer"
+          rc=0
+          DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$implementer")" implement "$worktree" "$prompt_file" || rc=$?
+        else
+          printf 'addressing review feedback on PR #%s (fix round %s of %s) via %s\n' \
+            "$pr_number" "$fix_round" "$max_rounds" "$implementer"
+          rc=0
+          DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$implementer")" implement "$worktree" "$fix_prompt_file" || rc=$?
+        fi
+        if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
+          notify "dev/devloop paused" "issue #$issue_number: $(cat "$(pause_marker)" 2>/dev/null || echo 'unknown reason')"
+          return "$PAUSE_EXIT_CODE"
+        elif [[ "$rc" -eq "$TRANSIENT_EXIT_CODE" ]]; then
+          interrupted "implementer backend '$implementer' lost its connection"
+          return "$TRANSIENT_EXIT_CODE"
+        elif [[ "$rc" -ne 0 ]]; then
+          mark_needs_attention "$issue_number" "implementer backend '$implementer' failed$([[ "$phase" == fix ]] && printf ' during fix round %s on PR #%s' "$fix_round" "$pr_number")"
+          rm -f "$state_dir/current"
+          return 1
+        fi
+
+        run_local_checks "$issue_number" "$worktree" "$test_cmd" ||
+          { rm -f "$state_dir/current"; return 1; }
+
+        # A clean worktree here really does mean the implementer changed nothing: the publish
+        # phase, which commits, is recorded before anything is committed, so a run interrupted
+        # after committing resumes in publish and never lands here with its work hidden in a
+        # commit.
+        if [[ -z "$(cd "$worktree" && git status --porcelain)" ]]; then
+          if [[ "$phase" == "implement" ]]; then
+            mark_no_changes_needed "$issue_number"
+            git worktree remove "$worktree" --force 2>/dev/null || true
+            rm -f "$state_dir/current" "$prompt_file"
+            return 0
+          fi
+          # Unlike the first implementation, no changes here is not "already satisfied": the
+          # reviewer asked for something and the implementer declined (or gave up). A human
+          # has to arbitrate — its summary above should say why.
+          mark_needs_attention "$issue_number" "implementer made no changes in response to review feedback on PR #$pr_number (fix round $fix_round)"
+          rm -f "$state_dir/current"
+          return 1
+        fi
+
+        phase="publish"
+        write_state "$state_dir/current" || die "failed to advance state to the publish phase"
+        ;;
+
+      publish)
+        # Commit whatever is uncommitted (nothing, if an earlier attempt got as far as
+        # committing), push (a no-op if already pushed), and open the PR unless it exists.
+        if [[ -n "$(cd "$worktree" && git status --porcelain)" ]]; then
+          if [[ -z "$pr_number" ]]; then
+            message="$title
+
+Closes #$issue_number"
+          else
+            message="Address review feedback on #$issue_number (round $fix_round)"
+          fi
+          (cd "$worktree" && git add -A && git commit -m "$message") ||
+            { mark_needs_attention "$issue_number" "git commit failed"; rm -f "$state_dir/current"; return 1; }
+        fi
+        retry git -C "$worktree" push -u "$GITHUB_REMOTE" "$branch" ||
+          { interrupted "git push failed"; return "$TRANSIENT_EXIT_CODE"; }
+        if [[ -z "$pr_number" ]]; then
+          pr_number="$(open_pr "$worktree" "$branch" "$title" "$issue_number")" ||
+            { interrupted "could not open a PR for branch $branch"; return "$TRANSIENT_EXIT_CODE"; }
+        fi
+        phase="review"
+        write_state "$state_dir/current" || die "failed to advance state to the review phase"
+        ;;
+
       review)
         pushed_head="$(cd "$worktree" && git rev-parse HEAD)" ||
           { mark_needs_attention "$issue_number" "could not read the worktree HEAD before reviewing PR #$pr_number"; rm -f "$state_dir/current"; return 1; }
         wait_for_pr_head "$pr_number" "$pushed_head" ||
-          { mark_needs_attention "$issue_number" "PR #$pr_number never showed pushed commit ${pushed_head:0:7} on GitHub, so it was not reviewed"; rm -f "$state_dir/current"; return 1; }
+          { interrupted "PR #$pr_number does not show pushed commit ${pushed_head:0:7} on GitHub yet"; return "$TRANSIENT_EXIT_CODE"; }
         printf 'reviewing PR #%s via %s\n' "$pr_number" "$reviewer"
         feedback_file="$state_dir/review-$issue_number-round-$fix_round.md"
         # A leftover file from an interrupted earlier attempt must not be mistaken for
@@ -519,6 +627,9 @@ Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit fa
         if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
           notify "dev/devloop paused" "issue #$issue_number: $(cat "$(pause_marker)" 2>/dev/null || echo 'unknown reason')"
           return "$PAUSE_EXIT_CODE"
+        elif [[ "$rc" -eq "$TRANSIENT_EXIT_CODE" ]]; then
+          interrupted "reviewer backend '$reviewer' lost its connection"
+          return "$TRANSIENT_EXIT_CODE"
         elif [[ "$rc" -ne 0 ]]; then
           # Exit 1 means either "changes requested" or "the backend itself broke". Only the
           # former writes a feedback file, and a fix round is pointless without one.
@@ -536,63 +647,45 @@ Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit fa
           build_fix_prompt_file "$prompt_file" "$feedback_file" "$pr_number" "$fix_round" "$max_rounds" "$fix_prompt_file" ||
             { mark_needs_attention "$issue_number" "failed to write the fix-round prompt file"; rm -f "$state_dir/current"; return 1; }
           phase="fix"
-          write_state "$state_dir/current" ||
-            die "failed to advance state to fix round $fix_round"
+          write_state "$state_dir/current" || die "failed to advance state to fix round $fix_round"
           continue
         fi
+        phase="merge"
+        write_state "$state_dir/current" || die "failed to advance state to the merge phase"
+        ;;
 
-        if ! gh pr checks "$pr_number" --watch; then
-          mark_needs_attention "$issue_number" "required PR checks are not green on PR #$pr_number"
+      merge)
+        rc=0
+        wait_for_checks "$pr_number" || rc=$?
+        if [[ "$rc" -eq 1 ]]; then
+          mark_needs_attention "$issue_number" "PR checks failed on PR #$pr_number"
           rm -f "$state_dir/current"
           return 1
+        elif [[ "$rc" -ne 0 ]]; then
+          interrupted "PR #$pr_number checks are still pending or could not be read"
+          return "$TRANSIENT_EXIT_CODE"
         fi
 
-        gh pr merge "$pr_number" --squash --delete-branch ||
-          { mark_needs_attention "$issue_number" "gh pr merge failed"; return 1; }
+        # A merge that reported an error may still have gone through, so check before
+        # deciding it failed.
+        if ! retry gh pr merge "$pr_number" --squash --delete-branch &&
+          [[ "$(gh pr view "$pr_number" --json state -q .state 2>/dev/null)" != "MERGED" ]]; then
+          if [[ "$(gh pr view "$pr_number" --json mergeable -q .mergeable 2>/dev/null)" == "CONFLICTING" ]]; then
+            mark_needs_attention "$issue_number" "PR #$pr_number conflicts with $(base_branch) and cannot be merged"
+            rm -f "$state_dir/current"
+            return 1
+          fi
+          interrupted "gh pr merge failed for PR #$pr_number"
+          return "$TRANSIENT_EXIT_CODE"
+        fi
         # The issue auto-closes via "Closes #<n>" in the PR body, but that doesn't clear the
         # label devloop itself added — do it explicitly so a closed issue doesn't sit there
         # looking like it's still in progress.
-        gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" 2>/dev/null || true
+        retry gh issue edit "$issue_number" --remove-label "$LABEL_IN_PROGRESS" 2>/dev/null || true
         git worktree remove "$worktree" --force 2>/dev/null || true
         rm -f "$state_dir/current" "$prompt_file" "$fix_prompt_file" "$state_dir/review-$issue_number-round-"*.md
         printf 'merged PR #%s for issue #%s\n' "$pr_number" "$issue_number"
         return 0
-        ;;
-
-      fix)
-        printf 'addressing review feedback on PR #%s (fix round %s of %s) via %s\n' \
-          "$pr_number" "$fix_round" "$max_rounds" "$implementer"
-        rc=0
-        DEVLOOP_STATE_DIR="$state_dir" "$(backend_script "$implementer")" implement "$worktree" "$fix_prompt_file" || rc=$?
-        if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
-          notify "dev/devloop paused" "issue #$issue_number: $(cat "$(pause_marker)" 2>/dev/null || echo 'unknown reason')"
-          return "$PAUSE_EXIT_CODE"
-        elif [[ "$rc" -ne 0 ]]; then
-          mark_needs_attention "$issue_number" "implementer backend '$implementer' failed during fix round $fix_round on PR #$pr_number"
-          rm -f "$state_dir/current"
-          return 1
-        fi
-
-        run_local_checks "$issue_number" "$worktree" "$test_cmd" ||
-          { rm -f "$state_dir/current"; return 1; }
-
-        # Unlike the first implementation, no changes here is not "already satisfied": the
-        # reviewer asked for something and the implementer declined (or gave up). A human
-        # has to arbitrate — its summary above should say why.
-        if [[ -z "$(cd "$worktree" && git status --porcelain)" ]]; then
-          mark_needs_attention "$issue_number" "implementer made no changes in response to review feedback on PR #$pr_number (fix round $fix_round)"
-          rm -f "$state_dir/current"
-          return 1
-        fi
-
-        (cd "$worktree" && git add -A && git commit -m "Address review feedback on #$issue_number (round $fix_round)") ||
-          { mark_needs_attention "$issue_number" "git commit failed in fix round $fix_round"; rm -f "$state_dir/current"; return 1; }
-        (cd "$worktree" && git push "$GITHUB_REMOTE" "$branch") ||
-          { mark_needs_attention "$issue_number" "git push failed in fix round $fix_round"; rm -f "$state_dir/current"; return 1; }
-
-        phase="review"
-        write_state "$state_dir/current" ||
-          die "failed to advance state back to the review phase"
         ;;
 
       *)
@@ -603,7 +696,9 @@ Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit fa
 }
 
 run_loop() {
-  local once=0
+  local once=0 backoff=0 interruptions=0
+  local initial_backoff="${DEVLOOP_BACKOFF_SECONDS:-60}" max_backoff="${DEVLOOP_MAX_BACKOFF_SECONDS:-1800}"
+  local max_interruptions="${DEVLOOP_MAX_INTERRUPTIONS:-12}"
   [[ "${1:-}" == "--once" ]] && once=1
 
   require_labels
@@ -611,11 +706,33 @@ run_loop() {
   while true; do
     local rc=0
     run_one_cycle || rc=$?
-    if [[ "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
-      exit "$PAUSE_EXIT_CODE"
+    if [[ "$rc" -eq "$TRANSIENT_EXIT_CODE" && "$once" -eq 0 ]]; then
+      # Network or GitHub trouble: wait and carry on, doubling the wait each time it happens
+      # in a row, rather than leaving an unattended run stopped until someone notices. Give up
+      # after max_interruptions in a row (about 4.5 hours with the defaults): by then it's an
+      # outage worth a human's attention, or a failure misread as a connection problem.
+      interruptions=$((interruptions + 1))
+      if (( interruptions > max_interruptions )); then
+        notify "dev/devloop stopped" "still interrupted after $max_interruptions attempts in a row; resume with dev/devloop run"
+        printf 'still interrupted after %s attempts in a row; stopping (dev/devloop run resumes)\n' "$max_interruptions" >&2
+        exit "$TRANSIENT_EXIT_CODE"
+      fi
+      if (( backoff == 0 )); then
+        backoff="$initial_backoff"
+        notify "dev/devloop waiting" "network or GitHub trouble; retrying with back-off up to ${max_backoff}s"
+      else
+        backoff=$((backoff * 2 > max_backoff ? max_backoff : backoff * 2))
+      fi
+      printf 'waiting %ss before trying again\n' "$backoff" >&2
+      sleep "$backoff"
+      continue
+    elif [[ "$rc" -eq "$TRANSIENT_EXIT_CODE" || "$rc" -eq "$PAUSE_EXIT_CODE" ]]; then
+      exit "$rc"
     elif [[ "$rc" -ne 0 ]]; then
       exit 1
     fi
+    backoff=0
+    interruptions=0
     [[ "$once" -eq 1 ]] && exit 0
   done
 }

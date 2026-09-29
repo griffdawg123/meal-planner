@@ -7,7 +7,8 @@
 #   dev/backends/amp review <pr-number> <issue-number>
 #
 # Exit codes: 0 = success, 1 = failed, 75 = paused (credits/quota exhausted; writes
-# $DEVLOOP_STATE_DIR/paused and leaves everything else untouched).
+# $DEVLOOP_STATE_DIR/paused and leaves everything else untouched), 69 = lost its connection
+# (network, GitHub, or Amp-side error; dev/devloop resumes the same step later).
 #
 # implement dispatches to a real Amp orb via dev/orb (dev/orb start, then dev/orb sync once
 # the orb is done) because it needs a full checkout to edit files and run tests in — this is
@@ -22,6 +23,11 @@ set -euo pipefail
 
 readonly PAUSE_EXIT_CODE=75
 readonly EXHAUSTED_PATTERN='credit|quota exceeded|insufficient credits|rate limit exceeded|out of credits'
+readonly TRANSIENT_EXIT_CODE=69
+# Connection and server-side failures worth retrying later rather than treating as a failed task.
+# A text heuristic, only consulted when the command already failed, and not yet confirmed against
+# a real occurrence of each message.
+readonly TRANSIENT_PATTERN='ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|network error|connection error|could not resolve host|overloaded|HTTP 5[0-9][0-9]|502 Bad Gateway|503 Service Unavailable|504 Gateway'
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -47,6 +53,15 @@ mark_paused() {
 # real exhausted-credits message — tighten it the first time this misses or misfires.
 looks_like_exhausted() {
   grep -qiE "$EXHAUSTED_PATTERN" "$1"
+}
+
+looks_transient() {
+  grep -qiE "$TRANSIENT_PATTERN" "$1"
+}
+
+lost_connection() {
+  printf '%s lost its connection; dev/devloop will resume this step\n' "$1" >&2
+  exit "$TRANSIENT_EXIT_CODE"
 }
 
 # Confirmed against a real, already-finished orb thread's export payload: the completion
@@ -86,6 +101,9 @@ implement() {
     mark_paused "implement backend (dev/orb start) reported exhausted credits/quota"
     exit "$PAUSE_EXIT_CODE"
   fi
+  if [[ "$rc" -ne 0 ]] && looks_transient <(printf '%s' "$start_output"); then
+    lost_connection "implement backend (dev/orb start)"
+  fi
   [[ "$rc" -eq 0 ]] || exit 1
 
   thread_id="$(printf '%s' "$start_output" | grep -Eo 'T-[[:alnum:]-]+' | tail -n1)"
@@ -113,7 +131,16 @@ implement() {
   # the thread's commit triggers an interactive prompt with no TTY to answer it. The worktree
   # is freshly created for this task and touched by nothing else, so checking out the thread's
   # commit unconditionally is safe here.
-  (cd "$worktree" && amp sync --apply "$thread_id" --checkout)
+  local sync_output
+  set +e
+  sync_output="$(cd "$worktree" && amp sync --apply "$thread_id" --checkout 2>&1)"
+  rc=$?
+  set -e
+  printf '%s\n' "$sync_output"
+  if [[ "$rc" -ne 0 ]] && looks_transient <(printf '%s' "$sync_output"); then
+    lost_connection "implement backend (amp sync)"
+  fi
+  [[ "$rc" -eq 0 ]] || exit 1
 }
 
 review() {
@@ -123,9 +150,10 @@ review() {
   require_command gh
   require_command amp
 
-  diff="$(gh pr diff "$pr_number")" || die "could not fetch diff for PR #$pr_number"
-  issue_title="$(gh issue view "$issue_number" --json title -q .title 2>/dev/null || true)"
-  issue_body="$(gh issue view "$issue_number" --json body -q .body 2>/dev/null || true)"
+  # A failure to read the PR or issue from GitHub is a connection problem, not a verdict.
+  diff="$(gh pr diff "$pr_number")" || lost_connection "review backend (gh pr diff)"
+  issue_title="$(gh issue view "$issue_number" --json title -q .title)" || lost_connection "review backend (gh issue view)"
+  issue_body="$(gh issue view "$issue_number" --json body -q .body)" || lost_connection "review backend (gh issue view)"
 
   prompt="$(cat <<EOF
 Review this pull request against the GitHub issue it claims to close. Look for
@@ -167,11 +195,17 @@ EOF
   fi
   if [[ "$rc" -ne 0 ]]; then
     printf '%s\n' "$output" >&2
+    if looks_transient <(printf '%s' "$output"); then
+      lost_connection "review backend (amp -x)"
+    fi
     exit 1
   fi
 
   printf '%s\n' "$output"
-  gh pr comment "$pr_number" --body "$output" >/dev/null
+  # Post before reporting a verdict: without the comment on the PR, a human looking at a stopped
+  # loop wouldn't see what the reviewer said. Failing to post is a connection problem; the review
+  # is simply redone on resume.
+  gh pr comment "$pr_number" --body "$output" >/dev/null || lost_connection "review backend (gh pr comment)"
 
   if printf '%s' "$output" | grep -q 'DEVLOOP_VERDICT: *PASS'; then
     exit 0

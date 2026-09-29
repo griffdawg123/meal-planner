@@ -7,12 +7,18 @@
 #   dev/backends/claude review <pr-number> <issue-number>
 #
 # Exit codes: 0 = success, 1 = failed, 75 = paused (daily usage limit hit;
-# writes $DEVLOOP_STATE_DIR/paused and leaves everything else untouched).
+# writes $DEVLOOP_STATE_DIR/paused and leaves everything else untouched), 69 = lost its connection
+# (network or API-side error; dev/devloop resumes the same step later).
 
 set -euo pipefail
 
 readonly PAUSE_EXIT_CODE=75
 readonly USAGE_LIMIT_PATTERN='usage limit|limit reset|resets at|rate limit exceeded'
+readonly TRANSIENT_EXIT_CODE=69
+# Connection and server-side failures worth retrying later rather than treating as a failed task.
+# Like USAGE_LIMIT_PATTERN, a text heuristic: only consulted when the command already failed, and
+# not yet confirmed against a real occurrence of each message.
+readonly TRANSIENT_PATTERN='ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|network error|connection error|could not resolve host|overloaded|API Error: 5[0-9][0-9]|HTTP 5[0-9][0-9]|502 Bad Gateway|503 Service Unavailable|504 Gateway'
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -36,6 +42,10 @@ mark_paused() {
 # message in a paused-but-not-detected run.
 looks_like_usage_limit() {
   grep -qiE "$USAGE_LIMIT_PATTERN" "$1"
+}
+
+looks_transient() {
+  grep -qiE "$TRANSIENT_PATTERN" "$@"
 }
 
 implement() {
@@ -72,6 +82,11 @@ implement() {
   fi
 
   cat "$output_file"
+  if [[ "$rc" -ne 0 ]] && looks_transient "$output_file"; then
+    printf 'implement backend lost its connection; dev/devloop will resume this step\n' >&2
+    rm -f "$output_file"
+    exit "$TRANSIENT_EXIT_CODE"
+  fi
   rm -f "$output_file"
   [[ "$rc" -eq 0 ]] || exit 1
 }
@@ -106,6 +121,11 @@ review() {
 
   if [[ "$rc" -ne 0 ]]; then
     cat "$output_file" >&2
+    if looks_transient "$output_file" "$progress_file"; then
+      printf 'review backend lost its connection; dev/devloop will resume this step\n' >&2
+      rm -f "$output_file" "$progress_file"
+      exit "$TRANSIENT_EXIT_CODE"
+    fi
     rm -f "$output_file" "$progress_file"
     exit 1
   fi
