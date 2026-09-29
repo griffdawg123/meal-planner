@@ -1,1 +1,5 @@
 .amp/
+
+# Secrets such as the Telegram bot token must never be committed.
+.env
+*.token
