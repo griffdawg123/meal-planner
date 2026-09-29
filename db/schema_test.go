@@ -1,6 +1,7 @@
 package db_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -339,6 +340,72 @@ func TestApplySchemaUpgradesMagicLinkLifecycle(t *testing.T) {
 	}
 	if _, err := database.Exec(`UPDATE magic_link SET used_at = NULL WHERE token_hash = ?`, tokenHash(1)); err == nil {
 		t.Error("reset consumed magic link after upgrade: got nil error, want error")
+	}
+}
+
+func TestApplySchemaDiscardsInvalidLegacyMagicLinks(t *testing.T) {
+	legacySchema, err := os.ReadFile("testdata/schema_before_magic_link_lifecycle.sql")
+	if err != nil {
+		t.Fatalf("read legacy schema: %v", err)
+	}
+	database := openTestDatabase(t)
+	if _, err := database.Exec(string(legacySchema)); err != nil {
+		t.Fatalf("apply legacy schema: %v", err)
+	}
+	insertHousehold(t, database, "household-1", "member-1")
+
+	// Every row below was accepted by the legacy schema's constraints.
+	legacyRows := []struct {
+		name      string
+		hash      any
+		createdAt any
+		expiresAt any
+		usedAt    any
+	}{
+		{"valid unused link", tokenHash(1), 100, 200, nil},
+		{"valid consumed link", tokenHash(2), 100, 200, 150},
+		{"non-expiring link", tokenHash(3), 100, "never", nil},
+		{"fractional created_at", tokenHash(4), 100.5, 200, nil},
+		{"null token hash", nil, 100, 200, nil},
+		{"text token hash", strings.Repeat("x", 32), 100, 200, nil},
+		{"consumed at expiry", tokenHash(5), 100, 200, 200},
+		{"consumed before creation", tokenHash(6), 100, 200, 99},
+		{"text used_at", tokenHash(7), 100, 200, "soon"},
+	}
+	for _, row := range legacyRows {
+		if _, err := database.Exec(
+			`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?)`,
+			row.hash, "member-1", row.createdAt, row.expiresAt, row.usedAt,
+		); err != nil {
+			t.Fatalf("insert legacy %s: %v", row.name, err)
+		}
+	}
+
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("upgrade schema: %v", err)
+	}
+
+	rows, err := database.Query(`SELECT token_hash FROM magic_link ORDER BY created_at, used_at`)
+	if err != nil {
+		t.Fatalf("query magic links: %v", err)
+	}
+	defer rows.Close()
+
+	var remaining [][]byte
+	for rows.Next() {
+		var hash []byte
+		if err := rows.Scan(&hash); err != nil {
+			t.Fatalf("scan magic link: %v", err)
+		}
+		remaining = append(remaining, hash)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate magic links: %v", err)
+	}
+
+	want := [][]byte{tokenHash(1), tokenHash(2)}
+	if len(remaining) != len(want) || !bytes.Equal(remaining[0], want[0]) || !bytes.Equal(remaining[1], want[1]) {
+		t.Fatalf("magic links after upgrade: got %x, want %x", remaining, want)
 	}
 }
 

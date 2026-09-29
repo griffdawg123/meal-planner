@@ -168,6 +168,23 @@ BEGIN
     SELECT RAISE(ABORT, 'magic link has already been used');
 END;
 
+-- The triggers only guard future writes. Rows written before they existed
+-- may break the same rules, and consuming one would then abort inside the
+-- update trigger. Links are short-lived and reissued on request, so discard
+-- any such row rather than repair it. After the first upgrade this matches
+-- nothing, keeping the schema safe to reapply.
+DELETE FROM magic_link
+WHERE typeof(token_hash) <> 'blob'
+    OR length(token_hash) <> 32
+    OR typeof(created_at) <> 'integer'
+    OR typeof(expires_at) <> 'integer'
+    OR expires_at <= created_at
+    OR (used_at IS NOT NULL AND (
+        typeof(used_at) <> 'integer'
+        OR used_at < created_at
+        OR used_at >= expires_at
+    ));
+
 CREATE TABLE IF NOT EXISTS web_session (
     token_hash BLOB PRIMARY KEY
                     CHECK (length(token_hash) = 32),
