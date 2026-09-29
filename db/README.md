@@ -132,6 +132,14 @@ failed attempts; the hash keeps a leaked database from revealing live codes but 
 low-entropy code resistant to offline guessing. Expired or used rows are inert and may be pruned at
 any time. The `member_id` index serves pruning and cascading deletes.
 
+`telegram_link_attempt` enforces that failed-attempt limit. It holds one row per Telegram user ID
+with `failed_attempts`, the number of invalid codes sent since `window_started_at` (Unix seconds).
+Each link attempt increments the count, or restarts it at 1 when the window has passed, in the same
+transaction that checks the code. The service keeps that increment only when the code is invalid,
+and once the count exceeds its limit it rejects every attempt, even one with a valid code, until
+the window ends. A successful link deletes the row. Senders are usually not linked yet, so the table
+has no foreign key; rows whose window has passed are inert and may be pruned at any time.
+
 Both tables cascade on member deletion (and therefore household deletion), so a removed member's
 Telegram account immediately becomes unlinked and their outstanding codes stop working.
 

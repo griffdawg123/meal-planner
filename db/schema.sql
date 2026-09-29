@@ -246,4 +246,16 @@ BEGIN
     SELECT RAISE(ABORT, 'telegram link code has already been used');
 END;
 
+-- Invalid link codes sent by each Telegram user within the current window,
+-- so the service can refuse further guesses. Senders are usually unlinked,
+-- so this table deliberately has no foreign key.
+CREATE TABLE IF NOT EXISTS telegram_link_attempt (
+    telegram_user_id  INTEGER NOT NULL PRIMARY KEY
+                           CHECK (typeof(telegram_user_id) = 'integer' AND telegram_user_id > 0),
+    failed_attempts   INTEGER NOT NULL
+                           CHECK (typeof(failed_attempts) = 'integer' AND failed_attempts > 0),
+    window_started_at INTEGER NOT NULL
+                           CHECK (typeof(window_started_at) = 'integer')
+) WITHOUT ROWID;
+
 COMMIT;
