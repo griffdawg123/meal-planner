@@ -43,45 +43,54 @@ dev/devloop run --once    # do a single issue and stop
 
 ## What one cycle does
 
+A cycle moves through phases: **setup → implement → publish → review ⇄ fix →
+merge**. The current phase is saved in `$(git rev-parse --git-path
+devloop-state)/current` *before* that phase's work starts, and every phase is
+safe to re-run. However a run ends (killed, paused, network down), the next
+`dev/devloop run` resumes where it stopped. See [Interruptions and network
+errors](#interruptions-and-network-errors).
+
 1. Picks the lowest-numbered open `task` issue that isn't already labeled
    `devloop:in-progress`, `devloop:needs-attention`, or
    `devloop:no-changes-needed`. If the issue body references
    `Parent story: #N`, fetches that story's body too (acceptance criteria
-   usually live there, not on the task).
-2. Labels the issue `devloop:in-progress`, creates
-   `../meal-planner-issue-<n>` as a fresh worktree/branch off the base
-   branch (mirrors the concurrent-orb pattern in `docs/orb-workflow.md`).
-3. Writes a prompt file combining the issue, the parent story, and this
-   repo's house rules (failing-test-first, Go test conventions, don't touch
-   git/GitHub), then dispatches it to the implementer backend.
-4. Runs `gofmt -l`, `go vet ./...`, and the configured test command in the
-   worktree. Any failure here — or a non-zero implementer exit — labels the
-   issue `devloop:needs-attention`, leaves the worktree for inspection, and
-   **stops the loop** (no unattended retries).
-5. If the implementer backend succeeded but left the worktree with nothing
-   to commit, the issue is already satisfied by existing code (commonly:
+   usually live there, not on the task). Writes a prompt file combining the
+   issue, the parent story, and this repo's house rules (failing-test-first,
+   Go test conventions, don't touch git/GitHub).
+2. Labels the issue `devloop:in-progress` and immediately saves the resume
+   state, so a claimed issue is never left without it.
+3. **setup:** creates `../meal-planner-issue-<n>` as a fresh worktree/branch
+   off the base branch (mirrors the concurrent-orb pattern in
+   `docs/orb-workflow.md`).
+4. **implement:** dispatches the prompt to the implementer backend, then runs
+   `gofmt -l`, `go vet ./...`, and the configured test command in the
+   worktree. A failing check or implementer labels the issue
+   `devloop:needs-attention`, leaves the worktree for inspection, and **stops
+   the loop**.
+5. If the implementer succeeded but left the worktree with nothing to
+   commit, the issue is already satisfied by existing code (commonly:
    another issue's work covered it too). Labels it
    `devloop:no-changes-needed`, comments why, and **closes it directly** —
    this doesn't stop the loop, it moves on to the next issue.
-6. Otherwise commits, pushes the branch, opens the PR with `Closes #<n>`.
-   Opening the PR is retried up to 3 times (15s, then 30s apart) because
-   GitHub's API gives occasional transient 5xx errors. Each attempt first
-   looks for an open PR for the branch, so a create that reported an error
-   but actually went through is picked up rather than duplicated.
-7. Waits until GitHub shows the commit just pushed as the PR's head
-   (polling up to 8 times, 15s apart). Reviewers read the PR from GitHub,
-   which can briefly lag a push, and reviewing too early re-reviews the
-   previous commit. If it never catches up, the loop stops with
-   needs-attention instead of reviewing stale code. Then dispatches the
-   reviewer backend against the PR. If it requests changes,
-   runs a **fix round** (see below) and reviews again, up to
-   `devloop.maxFixRounds` times (default 2). Still requesting changes after
-   that — or a reviewer that fails without leaving any findings — does the
-   same needs-attention-and-stop as step 4.
-8. If every PR check is green too (`gh pr checks --watch`, not `--required` —
-   `main` isn't branch-protected yet, and `--required` would silently see
-   zero required checks and pass trivially), merges (`--squash
-   --delete-branch`), removes the worktree, and moves to the next issue.
+6. **publish:** commits, pushes the branch, and opens the PR with
+   `Closes #<n>`. Each step is safe to repeat: commit only if there are
+   uncommitted changes, push is a no-op when up to date, and opening the PR
+   first looks for an existing open PR for the branch. That matters because
+   a create that reported an error may actually have gone through.
+7. **review:** waits until GitHub shows the commit just pushed as the PR's
+   head (polling up to 8 times, 15s apart). Reviewers read the PR from
+   GitHub, which can briefly lag a push, and reviewing too early re-reviews
+   the previous commit. Then dispatches the reviewer backend against the PR.
+   If it requests changes, runs a **fix round** (see below) and reviews
+   again, up to `devloop.maxFixRounds` times (default 2). Still requesting
+   changes after that — or a reviewer that fails without leaving any
+   findings — does the same needs-attention-and-stop as step 4.
+8. **merge:** waits for the PR's checks by polling `statusCheckRollup`
+   (every 20s, up to 30 min). Any failed check stops with needs-attention,
+   and all passing merges (`--squash --delete-branch`). A merge that reports
+   an error is checked: if the PR is actually merged it carries on, and if it
+   conflicts with the base branch it stops with needs-attention. Then removes
+   the worktree and moves to the next issue.
 
 ## Fix rounds
 
@@ -121,6 +130,45 @@ chance to get there.
 first commit is on the issue branch, so a fix round with the `amp`
 implementer fails and stops with needs-attention. The `claude` implementer
 is fine.
+
+## Interruptions and network errors
+
+The loop is built to be restarted: **if a run stops for any reason other than
+needs-attention, run `dev/devloop run` again** and it resumes the in-flight
+issue from its saved phase. Finished work is never redone or misread. For
+example, a run killed after committing but before pushing resumes in
+**publish** and pushes that commit. It doesn't re-run the implementer on a
+clean worktree and wrongly close the issue as "no changes needed".
+
+Network and GitHub-side failures don't need a restart at all:
+
+- **Retried in place.** `git fetch`/`push` and `gh` calls are retried up to
+  5 times with growing waits (15s, 30s, 45s, 60s).
+- **Interrupted, not failed.** If retries run out, or a backend exits 69
+  (lost its connection), the cycle ends as *interrupted*. The issue's labels,
+  worktree, and resume state are left exactly as they are, and nothing is
+  flagged needs-attention. `devloop:needs-attention` is reserved for
+  problems a human has to look at: failing checks or tests, a reviewer that
+  still objects, an implementer that declines or fails, a merge conflict.
+- **Continuous mode waits and carries on.** `dev/devloop run` sleeps (60s,
+  doubling up to 30 min) and resumes, so an unattended run survives an
+  outage. After 12 interruptions in a row (about 4.5 hours) it sends a
+  notification and exits 69, because by then it's a long outage or a real
+  failure being misread as a connection problem. `dev/devloop run --once`
+  exits 69 straight away.
+
+The backends' connection-error detection is a text heuristic
+(`TRANSIENT_PATTERN` in `dev/backends/claude` and `dev/backends/amp`), only
+consulted when the command has already failed. Like the usage-limit pattern,
+it hasn't been confirmed against every real message yet.
+
+Separately, run the loop inside `tmux` (or as a systemd user service) so a
+dropped SSH session or closed terminal doesn't kill it in the first place.
+
+Tuning (environment variables, mainly for testing):
+`DEVLOOP_RETRY_DELAY_SECONDS` (15), `DEVLOOP_BACKOFF_SECONDS` (60),
+`DEVLOOP_MAX_BACKOFF_SECONDS` (1800), `DEVLOOP_MAX_INTERRUPTIONS` (12),
+`DEVLOOP_CHECKS_POLL_SECONDS` (20), `DEVLOOP_CHECKS_MAX_POLLS` (90).
 
 ## Usage-limit pausing
 
@@ -182,13 +230,16 @@ A backend is any executable at `dev/backends/<name>` implementing:
 
 - `implement <worktree-path> <prompt-file>` — mutate the worktree in place
   into a complete, tested change. Exit 0 on success, 1 on failure, 75 if
-  paused on a usage limit (after writing `$DEVLOOP_STATE_DIR/paused`).
+  paused on a usage limit (after writing `$DEVLOOP_STATE_DIR/paused`), 69 if
+  it lost its connection (network, API, or GitHub-side error) so the step
+  should simply be retried later.
   Must behave synchronously from the orchestrator's point of view — an
   async backend (e.g. an Amp orb) is responsible for polling/blocking
   internally until its remote work finishes before returning.
 - `review <pr-number> <issue-number>` — read the PR diff and the issue
   (`gh`), post findings to the PR, and signal verdict via exit code (0 =
-  pass, 1 = changes requested, 75 = paused). Must not modify the worktree.
+  pass, 1 = changes requested, 75 = paused, 69 = lost its connection, e.g.
+  could not fetch the diff or post the comment). Must not modify the worktree.
   On changes requested it must also write the findings to
   `$DEVLOOP_REVIEW_FEEDBACK_FILE` for the next fix round, specific enough to
   act on without extra context. Write that file **only** on a real
