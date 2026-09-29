@@ -64,6 +64,52 @@ func TestPlanDinners(t *testing.T) {
 		}
 	})
 
+	t.Run("only plans meals that satisfy a member's hard cooking-time constraint", func(t *testing.T) {
+		quickRisotto := household.Meal{Title: "Quick risotto", Satisfies: []string{"under 30 minutes"}}
+		service := household.NewService(newTestDatabase(t))
+		created, member := newHouseholdWithMember(t, service)
+		addPreference(t, service, created.ID, "", sql.NullInt16{Int16: 5, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		addPreference(t, service, created.ID, member.ID, sql.NullInt16{}, "Under 30 minutes", household.CookingTime, household.Hard)
+		nights := weekPreferences(t, service, created.ID, "2026-10-05", "2026-10-06")
+
+		got := planDinners(t, nights, []household.Meal{lasagne, quickRisotto}, nil)
+
+		if want := []household.Meal{quickRisotto, quickRisotto}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("dinners: got %v, want %v", titles(got), titles(want))
+		}
+	})
+
+	t.Run("ignores an away member's hard cooking-time constraint", func(t *testing.T) {
+		quickRisotto := household.Meal{Title: "Quick risotto", Satisfies: []string{"under 30 minutes"}}
+		service := household.NewService(newTestDatabase(t))
+		created, member := newHouseholdWithMember(t, service)
+		addPreference(t, service, created.ID, "", sql.NullInt16{Int16: 5, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		addPreference(t, service, created.ID, member.ID, sql.NullInt16{}, "under 30 minutes", household.CookingTime, household.Hard)
+		if err := service.RecordAwayNights(context.Background(), created.ID, member.ID, "2026-10-05"); err != nil {
+			t.Fatalf("record away night: %v", err)
+		}
+		nights := weekPreferences(t, service, created.ID, "2026-10-05")
+
+		got := planDinners(t, nights, []household.Meal{quickRisotto, lasagne}, nil)
+
+		if want := []household.Meal{lasagne}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("dinners: got %v, want %v", titles(got), titles(want))
+		}
+	})
+
+	t.Run("reports a night on which members' hard constraints exclude every meal", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, member := newHouseholdWithMember(t, service)
+		addPreference(t, service, created.ID, created.CreatorID, sql.NullInt16{}, "Italian", household.Cuisine, household.Hard)
+		addPreference(t, service, created.ID, member.ID, sql.NullInt16{}, "Thai", household.Cuisine, household.Hard)
+		nights := weekPreferences(t, service, created.ID, "2026-10-05")
+
+		_, err := household.PlanDinners(nights, []household.Meal{lasagne, greenCurry}, nil)
+		if !errors.Is(err, household.ErrNoSuitableMeal) {
+			t.Fatalf("error: got %v, want ErrNoSuitableMeal", err)
+		}
+	})
+
 	t.Run("reports a night on which every meal is blocked", func(t *testing.T) {
 		service := household.NewService(newTestDatabase(t))
 		created, member := newHouseholdWithMember(t, service)
@@ -90,6 +136,56 @@ func TestPlanDinners(t *testing.T) {
 		}
 		if streak := longestStreak(got); streak != 1 {
 			t.Errorf("longest run of one meal: got %d, want 1 in %v", streak, titles(got))
+		}
+	})
+
+	t.Run("shares dinners between a household default and a member's equally strong preference", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, member := newHouseholdWithMember(t, service)
+		addPreference(t, service, created.ID, "", sql.NullInt16{Int16: 4, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		addPreference(t, service, created.ID, member.ID, sql.NullInt16{Int16: 4, Valid: true}, "Thai", household.Cuisine, household.Soft)
+		nights := weekPreferences(t, service, created.ID, "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10")
+
+		got := planDinners(t, nights, []household.Meal{lasagne, greenCurry}, nil)
+
+		if italian, thai := count(got, lasagne), count(got, greenCurry); italian != 3 || thai != 3 {
+			t.Errorf("Italian and Thai dinners: got %d and %d, want 3 and 3 in %v", italian, thai, titles(got))
+		}
+	})
+
+	t.Run("balances a member's preference against a stronger household default instead of overriding it", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, member := newHouseholdWithMember(t, service)
+		addPreference(t, service, created.ID, "", sql.NullInt16{Int16: 5, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		addPreference(t, service, created.ID, member.ID, sql.NullInt16{Int16: 3, Valid: true}, "Thai", household.Cuisine, household.Soft)
+		nights := weekPreferences(t, service, created.ID, "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10")
+
+		got := planDinners(t, nights, []household.Meal{lasagne, greenCurry}, nil)
+
+		italian, thai := count(got, lasagne), count(got, greenCurry)
+		if italian <= thai {
+			t.Errorf("Italian dinners: got %d, want more than the %d Thai dinners in %v", italian, thai, titles(got))
+		}
+		if thai < 2 {
+			t.Errorf("Thai dinners: got %d, want at least 2 of 6 in %v", thai, titles(got))
+		}
+	})
+
+	t.Run("balances a member's stronger preference against a household dislike", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, member := newHouseholdWithMember(t, service)
+		addPreference(t, service, created.ID, "", sql.NullInt16{Int16: 3, Valid: true}, "peanuts", household.Dislike, household.Soft)
+		addPreference(t, service, created.ID, member.ID, sql.NullInt16{Int16: 5, Valid: true}, "Thai", household.Cuisine, household.Soft)
+		nights := weekPreferences(t, service, created.ID, "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10")
+
+		got := planDinners(t, nights, []household.Meal{padThai, risotto}, nil)
+
+		thai, plain := count(got, padThai), count(got, risotto)
+		if thai <= plain {
+			t.Errorf("Pad thai dinners: got %d, want more than the %d risotto dinners in %v", thai, plain, titles(got))
+		}
+		if plain < 2 {
+			t.Errorf("risotto dinners: got %d, want at least 2 of 6 in %v", plain, titles(got))
 		}
 	})
 

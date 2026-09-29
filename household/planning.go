@@ -19,8 +19,9 @@ type Meal struct {
 	Conflicts []string
 }
 
-// PlanDinners chooses one candidate meal for each night, in order. A meal that conflicts with any of
-// a night's hard constraints is never chosen for that night.
+// PlanDinners chooses one candidate meal for each night, in order. A meal that breaks any of a
+// night's hard constraints is never chosen for that night: it must not conflict with a hard allergy,
+// diet, or dislike, and must satisfy a hard cuisine, budget, or cooking time.
 //
 // A soft preference is favorable (a cuisine, budget, or cooking time its owner wants a meal to
 // satisfy) or adverse (an allergy, diet, or dislike its owner wants a meal not to conflict with). A
@@ -85,11 +86,17 @@ type ledger struct {
 }
 
 func ledgerOf(preference WeightedPreference) ledger {
-	switch preference.Category {
+	return ledger{owner: preference.MemberID, adverse: adverse(preference.Category)}
+}
+
+// adverse reports whether a category names something its owner wants a meal not to conflict with,
+// rather than something they want a meal to satisfy.
+func adverse(category PreferenceCategory) bool {
+	switch category {
 	case Allergy, DietaryRestriction, Dislike:
-		return ledger{owner: preference.MemberID, adverse: true}
+		return true
 	default:
-		return ledger{owner: preference.MemberID}
+		return false
 	}
 }
 
@@ -112,9 +119,15 @@ func outcomes(dinner Meal, preferences []WeightedPreference) map[ledger]bool {
 	return won
 }
 
+// blocked reports whether meal breaks any constraint: by conflicting with an adverse one, or by
+// failing to satisfy a favorable one such as a required cooking time.
 func blocked(meal Meal, constraints []Preference) bool {
 	for _, constraint := range constraints {
-		if relates(meal.Conflicts, constraint.Value) {
+		if adverse(constraint.Category) {
+			if relates(meal.Conflicts, constraint.Value) {
+				return true
+			}
+		} else if !relates(meal.Satisfies, constraint.Value) {
 			return true
 		}
 	}
