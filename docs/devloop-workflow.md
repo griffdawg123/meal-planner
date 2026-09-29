@@ -64,6 +64,10 @@ dev/devloop run --once    # do a single issue and stop
    `devloop:no-changes-needed`, comments why, and **closes it directly** —
    this doesn't stop the loop, it moves on to the next issue.
 6. Otherwise commits, pushes the branch, opens the PR with `Closes #<n>`.
+   Opening the PR is retried up to 3 times (15s, then 30s apart) because
+   GitHub's API gives occasional transient 5xx errors. Each attempt first
+   looks for an open PR for the branch, so a create that reported an error
+   but actually went through is picked up rather than duplicated.
 7. Dispatches the reviewer backend against the PR. If it requests changes,
    runs a **fix round** (see below) and reviews again, up to
    `devloop.maxFixRounds` times (default 2). Still requesting changes after
