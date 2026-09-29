@@ -182,6 +182,71 @@ func (s *Service) ResolveTelegram(ctx context.Context, telegramUserID int64) (Pr
 	return principal, nil
 }
 
+// UnlinkTelegram removes the link for telegramUserID, as when a linked user asks the bot to unlink.
+// Afterwards the Telegram user resolves to no member until they link again with a new code. A
+// Telegram user that is not linked yields ErrTelegramNotLinked.
+func (s *Service) UnlinkTelegram(ctx context.Context, telegramUserID int64) error {
+	if telegramUserID <= 0 {
+		return fmt.Errorf("%w: telegram user ID must be positive", ErrInvalidInput)
+	}
+	result, err := s.database.ExecContext(ctx, `
+		DELETE FROM telegram_identity WHERE telegram_user_id = ?
+	`, telegramUserID)
+	if err != nil {
+		return fmt.Errorf("%w: unlink telegram identity: %v", ErrInternal, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%w: inspect telegram unlink: %v", ErrInternal, err)
+	}
+	if rowsAffected == 0 {
+		return ErrTelegramNotLinked
+	}
+	return nil
+}
+
+// UnlinkMemberTelegram removes the Telegram account linked to the given household member, so a
+// member can disconnect an account they no longer control. The caller must have authenticated that
+// member. A member outside the household yields ErrMemberNotFound, and a member with no linked
+// Telegram account yields ErrTelegramNotLinked.
+func (s *Service) UnlinkMemberTelegram(ctx context.Context, householdID, memberID string) error {
+	if strings.TrimSpace(householdID) == "" || strings.TrimSpace(memberID) == "" {
+		return fmt.Errorf("%w: household and member are required", ErrInvalidInput)
+	}
+	tx, err := s.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("%w: begin telegram unlink: %v", ErrInternal, err)
+	}
+	defer tx.Rollback()
+
+	var memberExists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM member WHERE household_id = ? AND id = ?)
+	`, householdID, memberID).Scan(&memberExists); err != nil {
+		return fmt.Errorf("%w: inspect member: %v", ErrInternal, err)
+	}
+	if !memberExists {
+		return fmt.Errorf("%w: %q", ErrMemberNotFound, memberID)
+	}
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM telegram_identity WHERE member_id = ?
+	`, memberID)
+	if err != nil {
+		return fmt.Errorf("%w: unlink member telegram identity: %v", ErrInternal, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%w: inspect telegram unlink: %v", ErrInternal, err)
+	}
+	if rowsAffected == 0 {
+		return ErrTelegramNotLinked
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%w: commit telegram unlink: %v", ErrInternal, err)
+	}
+	return nil
+}
+
 // newTelegramLinkCode returns a code formatted for reading and typing, such as "7K3M-Q9XA".
 func newTelegramLinkCode() (string, error) {
 	raw := make([]byte, telegramLinkCodeLength)
