@@ -107,6 +107,9 @@ Telegram identities are stored in two tables and linked with a one-time code:
 3. For every later message, the bot looks up the sender's Telegram user ID in
    `telegram_identity` and joins `member` to obtain the household and member. A user ID with no
    row is unlinked and must not be allowed to read or change any household's data.
+4. Unlinking, whether requested from the Telegram account or by the authenticated member, deletes
+   the `telegram_identity` row. The account then resolves to no member until it links again with a
+   new code.
 
 The code is issued to a known member rather than typed into the bot first, so possession of the
 code proves the Telegram account belongs to that member and a Telegram user can never choose the

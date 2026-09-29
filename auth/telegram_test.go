@@ -367,6 +367,166 @@ func TestTelegramIdentityLinking(t *testing.T) {
 	})
 }
 
+func TestTelegramIdentityUnlinking(t *testing.T) {
+	t.Run("unlinks a Telegram user so they no longer resolve to their member", func(t *testing.T) {
+		service, database, code := newTelegramCodeService(t)
+		linkTelegram(t, service, 1001, code)
+
+		if err := service.UnlinkTelegram(context.Background(), 1001); err != nil {
+			t.Fatalf("unlink Telegram: %v", err)
+		}
+
+		if _, err := service.ResolveTelegram(context.Background(), 1001); !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Errorf("resolve after unlink error: got %v, want ErrTelegramNotLinked", err)
+		}
+		if got := countRows(t, database, "member"); got != 1 {
+			t.Errorf("members after unlink: got %d, want 1", got)
+		}
+	})
+
+	t.Run("reports a Telegram user who is not linked, including on a repeated unlink", func(t *testing.T) {
+		service, _, code := newTelegramCodeService(t)
+
+		if err := service.UnlinkTelegram(context.Background(), 1001); !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Errorf("unlink never-linked error: got %v, want ErrTelegramNotLinked", err)
+		}
+		linkTelegram(t, service, 1001, code)
+		if err := service.UnlinkTelegram(context.Background(), 1001); err != nil {
+			t.Fatalf("first unlink: %v", err)
+		}
+		if err := service.UnlinkTelegram(context.Background(), 1001); !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Errorf("repeated unlink error: got %v, want ErrTelegramNotLinked", err)
+		}
+	})
+
+	t.Run("rejects zero and negative Telegram user IDs", func(t *testing.T) {
+		service := auth.NewService(newTestDatabase(t))
+
+		for _, telegramUserID := range []int64{0, -1} {
+			if err := service.UnlinkTelegram(context.Background(), telegramUserID); !errors.Is(err, auth.ErrInvalidInput) {
+				t.Errorf("unlink %d error: got %v, want ErrInvalidInput", telegramUserID, err)
+			}
+		}
+	})
+
+	t.Run("leaves other linked Telegram users in place", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMember(t, database, "household-1", "member-2")
+		service := auth.NewService(database)
+		linkTelegram(t, service, 1001, requestTelegramLinkCode(t, service, "household-1", "member-1"))
+		linkTelegram(t, service, 1002, requestTelegramLinkCode(t, service, "household-1", "member-2"))
+
+		if err := service.UnlinkTelegram(context.Background(), 1001); err != nil {
+			t.Fatalf("unlink Telegram: %v", err)
+		}
+
+		want := auth.Principal{HouseholdID: "household-1", MemberID: "member-2"}
+		got, err := service.ResolveTelegram(context.Background(), 1002)
+		if err != nil {
+			t.Fatalf("resolve remaining Telegram user: %v", err)
+		}
+		if got != want {
+			t.Errorf("remaining principal: got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("allows an unlinked Telegram user to link again with a new code", func(t *testing.T) {
+		service, _, code := newTelegramCodeService(t)
+		linkTelegram(t, service, 1001, code)
+		if err := service.UnlinkTelegram(context.Background(), 1001); err != nil {
+			t.Fatalf("unlink Telegram: %v", err)
+		}
+
+		linkTelegram(t, service, 1001, requestTelegramLinkCode(t, service, "household-1", "member-1"))
+
+		want := auth.Principal{HouseholdID: "household-1", MemberID: "member-1"}
+		got, err := service.ResolveTelegram(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("resolve relinked Telegram user: %v", err)
+		}
+		if got != want {
+			t.Errorf("relinked principal: got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("unlinks a member's Telegram account from the member's side", func(t *testing.T) {
+		service, _, code := newTelegramCodeService(t)
+		linkTelegram(t, service, 1001, code)
+
+		if err := service.UnlinkMemberTelegram(context.Background(), "household-1", "member-1"); err != nil {
+			t.Fatalf("unlink member Telegram: %v", err)
+		}
+
+		if _, err := service.ResolveTelegram(context.Background(), 1001); !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Errorf("resolve after member unlink error: got %v, want ErrTelegramNotLinked", err)
+		}
+	})
+
+	t.Run("reports a member with no linked Telegram account", func(t *testing.T) {
+		service, _, _ := newTelegramCodeService(t)
+
+		err := service.UnlinkMemberTelegram(context.Background(), "household-1", "member-1")
+		if !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Fatalf("unlink member error: got %v, want ErrTelegramNotLinked", err)
+		}
+	})
+
+	t.Run("rejects unlinking a member outside the household and leaves their link in place", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertHousehold(t, database, "household-2", "member-2")
+		service := auth.NewService(database)
+		linkTelegram(t, service, 1002, requestTelegramLinkCode(t, service, "household-2", "member-2"))
+
+		for _, target := range []struct{ householdID, memberID string }{
+			{"household-1", "member-2"},
+			{"household-1", "missing-member"},
+		} {
+			err := service.UnlinkMemberTelegram(context.Background(), target.householdID, target.memberID)
+			if !errors.Is(err, auth.ErrMemberNotFound) {
+				t.Errorf("unlink %s/%s error: got %v, want ErrMemberNotFound", target.householdID, target.memberID, err)
+			}
+		}
+
+		if got := countRows(t, database, "telegram_identity"); got != 1 {
+			t.Errorf("Telegram identities: got %d, want 1", got)
+		}
+	})
+
+	t.Run("rejects an empty household or member", func(t *testing.T) {
+		service := auth.NewService(newTestDatabase(t))
+
+		for _, target := range []struct{ householdID, memberID string }{
+			{"", "member-1"},
+			{"household-1", " "},
+		} {
+			err := service.UnlinkMemberTelegram(context.Background(), target.householdID, target.memberID)
+			if !errors.Is(err, auth.ErrInvalidInput) {
+				t.Errorf("unlink %q/%q error: got %v, want ErrInvalidInput", target.householdID, target.memberID, err)
+			}
+		}
+	})
+}
+
+func requestTelegramLinkCode(t *testing.T, service *auth.Service, householdID, memberID string) string {
+	t.Helper()
+
+	code, err := service.RequestTelegramLinkCode(context.Background(), householdID, memberID)
+	if err != nil {
+		t.Fatalf("request link code for %s: %v", memberID, err)
+	}
+	return code
+}
+
+func linkTelegram(t *testing.T, service *auth.Service, telegramUserID int64, code string) {
+	t.Helper()
+
+	if _, err := service.LinkTelegram(context.Background(), telegramUserID, code); err != nil {
+		t.Fatalf("link Telegram user %d: %v", telegramUserID, err)
+	}
+}
+
 func newTelegramCodeService(t *testing.T) (*auth.Service, *sql.DB, string) {
 	t.Helper()
 
