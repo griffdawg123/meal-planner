@@ -44,6 +44,30 @@ different household. SQLite permits the composite reference when `member_id` is 
 the intentional household-level scope. Both foreign keys cascade deletion so preferences cannot
 outlive their household or individual owner.
 
+The `away_night` table records attendance as exceptions: each row says one member will not be
+eating dinner at home on one night. Members are attending by default, so a night with no row for a
+member means that member is present, and the MVP needs no row per member per night. This matches
+how members state attendance ("I'm out on Tuesday") and keeps the default of portions matching
+attending members cheap to compute.
+
+- `night` is the calendar date of the dinner, formatted `YYYY-MM-DD`, in the household's
+  timezone. It is a local date rather than a UTC instant because a dinner belongs to a household
+  night regardless of when it is recorded. The `night IS date(night)` check rejects other formats,
+  times, and impossible dates such as `2026-02-30`.
+- `(member_id, night)` is the primary key, so a member is either away or not on a given night and
+  recording the same night twice is rejected. Changing attendance after a draft exists is a plain
+  insert (now away) or delete (now present again), with no status column to keep consistent.
+- The composite foreign key to `member(household_id, id)` prevents recording an away night for a
+  member of another household, and both foreign keys cascade so away nights cannot outlive their
+  household or member.
+- The `(household_id, night)` index serves the planner's lookup of who is away across the nights
+  of a planning period.
+
+The table only records attendance. How planning weights an away member's soft preferences, and
+the rule that hard constraints of present members still apply, belong to the planning logic.
+Recurring "regular nights out" are deferred; when added they can expand into or sit alongside
+these dated rows.
+
 Web authentication is stored in three tables. `web_identity` links one normalized email address
 to a member. `magic_link` stores short-lived, single-use login challenges, and `web_session` stores
 the resulting authenticated sessions. Both bearer-token tables persist only SHA-256 token hashes;
