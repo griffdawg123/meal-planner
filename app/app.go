@@ -2,7 +2,10 @@
 package app
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 
 	"github.com/griffdawg123/meal-planner/auth"
 	"github.com/griffdawg123/meal-planner/household"
@@ -32,6 +35,19 @@ func New(database *sql.DB, sender telegram.Sender) *App {
 		Auth:            authentication,
 		DraftPlanEvents: events,
 		Planner:         planner,
-		Commands:        telegram.NewCommands(authentication, households, planner, sender),
+		Commands:        telegram.NewCommands(authentication, households, planner, unavailableConfirmations{}, sender),
 	}
+}
+
+// ErrPlanConfirmationUnavailable identifies a plan confirmation refused because the planning
+// workflow cannot yet generate a confirmed plan's recipes and shopping list.
+var ErrPlanConfirmationUnavailable = errors.New("plan confirmation is not available yet")
+
+// unavailableConfirmations stands in for the planning workflow's confirmation step until it
+// exists. It refuses every confirmation, so no member is promised recipes or a shopping list that
+// will never be generated.
+type unavailableConfirmations struct{}
+
+func (unavailableConfirmations) ConfirmPlan(_ context.Context, householdID, _ string) error {
+	return fmt.Errorf("%w: household %q", ErrPlanConfirmationUnavailable, householdID)
 }
