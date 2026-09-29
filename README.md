@@ -30,3 +30,24 @@ with the `-db` flag:
 ```bash
 go run ./cmd/meal-planner -db /path/to/meal-planner.db
 ```
+
+## Telegram bot
+
+1. Register a bot with [@BotFather](https://t.me/BotFather) using `/newbot` and copy the token it
+   gives you.
+2. Provide the token as a secret, never in a committed file. Set exactly one of:
+   - `TELEGRAM_BOT_TOKEN` to the token itself, or
+   - `TELEGRAM_BOT_TOKEN_FILE` to the path of a file containing it, such as a Docker or systemd
+     secret.
+3. Run the application. It connects with long polling, so no public URL is needed:
+
+   ```bash
+   TELEGRAM_BOT_TOKEN_FILE=/run/secrets/telegram-bot-token go run ./cmd/meal-planner
+   ```
+
+   Long polling does not work while a webhook is set for the bot; remove one with the Bot API's
+   `deleteWebhook` method.
+4. Message the bot `/ping` and it replies `pong`; `/echo some text` replies with the same text.
+   These confirm the connection works end to end.
+
+Without a token, the application initializes the database and exits without starting the bot.
