@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -505,6 +506,72 @@ func TestTelegramIdentityUnlinking(t *testing.T) {
 			if !errors.Is(err, auth.ErrInvalidInput) {
 				t.Errorf("unlink %q/%q error: got %v, want ErrInvalidInput", target.householdID, target.memberID, err)
 			}
+		}
+	})
+}
+
+func TestHouseholdTelegramMembers(t *testing.T) {
+	t.Run("lists every member of the household with their linked Telegram user, or zero if unlinked", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMember(t, database, "household-1", "member-2")
+		insertMember(t, database, "household-1", "member-3")
+		insertHousehold(t, database, "household-2", "member-4")
+		service := auth.NewService(database)
+		linkTelegram(t, service, 1001, requestTelegramLinkCode(t, service, "household-1", "member-1"))
+		linkTelegram(t, service, 1003, requestTelegramLinkCode(t, service, "household-1", "member-3"))
+		linkTelegram(t, service, 1004, requestTelegramLinkCode(t, service, "household-2", "member-4"))
+
+		got, err := service.HouseholdTelegramMembers(context.Background(), "household-1")
+		if err != nil {
+			t.Fatalf("list household Telegram members: %v", err)
+		}
+
+		want := []auth.TelegramMember{
+			{MemberID: "member-1", TelegramUserID: 1001},
+			{MemberID: "member-2"},
+			{MemberID: "member-3", TelegramUserID: 1003},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("members: got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("reports a member as unlinked after their Telegram account is unlinked", func(t *testing.T) {
+		service, _, code := newTelegramCodeService(t)
+		linkTelegram(t, service, 1001, code)
+		if err := service.UnlinkTelegram(context.Background(), 1001); err != nil {
+			t.Fatalf("unlink Telegram: %v", err)
+		}
+
+		got, err := service.HouseholdTelegramMembers(context.Background(), "household-1")
+		if err != nil {
+			t.Fatalf("list household Telegram members: %v", err)
+		}
+
+		want := []auth.TelegramMember{{MemberID: "member-1"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("members: got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("returns no members for an unknown household", func(t *testing.T) {
+		service, _, _ := newTelegramCodeService(t)
+
+		got, err := service.HouseholdTelegramMembers(context.Background(), "missing-household")
+		if err != nil {
+			t.Fatalf("list household Telegram members: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("members: got %+v, want none", got)
+		}
+	})
+
+	t.Run("rejects an empty household", func(t *testing.T) {
+		service := auth.NewService(newTestDatabase(t))
+
+		if _, err := service.HouseholdTelegramMembers(context.Background(), " "); !errors.Is(err, auth.ErrInvalidInput) {
+			t.Fatalf("error: got %v, want ErrInvalidInput", err)
 		}
 	})
 }

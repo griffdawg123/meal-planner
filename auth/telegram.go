@@ -247,6 +247,46 @@ func (s *Service) UnlinkMemberTelegram(ctx context.Context, householdID, memberI
 	return nil
 }
 
+// TelegramMember is a household member and the Telegram user linked to them. TelegramUserID is zero
+// when the member has not linked a Telegram account.
+type TelegramMember struct {
+	MemberID       string
+	TelegramUserID int64
+}
+
+// HouseholdTelegramMembers lists every member of the household, ordered by member ID, with the
+// Telegram user linked to each, so household messages can reach every linked member. An unknown
+// household has no members.
+func (s *Service) HouseholdTelegramMembers(ctx context.Context, householdID string) ([]TelegramMember, error) {
+	if strings.TrimSpace(householdID) == "" {
+		return nil, fmt.Errorf("%w: household is required", ErrInvalidInput)
+	}
+	rows, err := s.database.QueryContext(ctx, `
+		SELECT member.id, coalesce(telegram_identity.telegram_user_id, 0)
+		FROM member
+		LEFT JOIN telegram_identity ON telegram_identity.member_id = member.id
+		WHERE member.household_id = ?
+		ORDER BY member.id
+	`, householdID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: list household telegram members: %v", ErrInternal, err)
+	}
+	defer rows.Close()
+
+	var members []TelegramMember
+	for rows.Next() {
+		var member TelegramMember
+		if err := rows.Scan(&member.MemberID, &member.TelegramUserID); err != nil {
+			return nil, fmt.Errorf("%w: read household telegram member: %v", ErrInternal, err)
+		}
+		members = append(members, member)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: list household telegram members: %v", ErrInternal, err)
+	}
+	return members, nil
+}
+
 // newTelegramLinkCode returns a code formatted for reading and typing, such as "7K3M-Q9XA".
 func newTelegramLinkCode() (string, error) {
 	raw := make([]byte, telegramLinkCodeLength)
