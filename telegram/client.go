@@ -69,10 +69,19 @@ func NewClient(baseURL, token string, httpClient *http.Client) *Client {
 	return &Client{baseURL: baseURL, token: token, httpClient: httpClient}
 }
 
-// GetMe returns the bot the token belongs to, confirming the token is valid.
+// ErrBotTokenRejected identifies that Telegram does not recognize the bot token, so the bot cannot
+// connect until the configured token is corrected.
+var ErrBotTokenRejected = errors.New("telegram rejected the bot token: check " + BotTokenEnv + " or " + BotTokenFileEnv)
+
+// GetMe returns the bot the token belongs to, confirming the token is valid. A token Telegram does
+// not recognize is reported wrapped in ErrBotTokenRejected.
 func (c *Client) GetMe(ctx context.Context) (User, error) {
 	var bot User
 	err := c.call(ctx, "getMe", nil, &bot)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && (apiErr.Code == http.StatusUnauthorized || apiErr.Code == http.StatusNotFound) {
+		return bot, fmt.Errorf("%w: %w", ErrBotTokenRejected, err)
+	}
 	return bot, err
 }
 

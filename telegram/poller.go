@@ -60,6 +60,9 @@ type Poller struct {
 	RetryDelay time.Duration
 	// OnError reports a failed poll or update. When nil, errors are logged.
 	OnError func(error)
+	// OnRecover reports a successful poll following failedPolls consecutive failed ones, so an
+	// outage's end is as visible as its start. When nil, the recovery is logged.
+	OnRecover func(failedPolls int)
 }
 
 // Run polls until ctx is done, then returns ctx's error. A failed update is reported and skipped,
@@ -67,6 +70,7 @@ type Poller struct {
 // A poll refused with a conflict is not retried: Run returns it, wrapped in ErrPollingConflict.
 func (p *Poller) Run(ctx context.Context) error {
 	var offset int64
+	var failedPolls int
 	for {
 		updates, err := p.Updates.GetUpdates(ctx, offset, p.Timeout)
 		if ctx.Err() != nil {
@@ -77,6 +81,7 @@ func (p *Poller) Run(ctx context.Context) error {
 			return fmt.Errorf("%w: %w", ErrPollingConflict, err)
 		}
 		if err != nil {
+			failedPolls++
 			p.report(fmt.Errorf("poll telegram updates: %w", err))
 			select {
 			case <-ctx.Done():
@@ -84,6 +89,10 @@ func (p *Poller) Run(ctx context.Context) error {
 			case <-time.After(p.RetryDelay):
 			}
 			continue
+		}
+		if failedPolls > 0 {
+			p.reportRecovery(failedPolls)
+			failedPolls = 0
 		}
 		for _, update := range updates {
 			if err := p.Handler.HandleUpdate(ctx, update); err != nil {
@@ -100,4 +109,12 @@ func (p *Poller) report(err error) {
 		return
 	}
 	log.Print(err)
+}
+
+func (p *Poller) reportRecovery(failedPolls int) {
+	if p.OnRecover != nil {
+		p.OnRecover(failedPolls)
+		return
+	}
+	log.Printf("telegram polling recovered after %d failed poll(s)", failedPolls)
 }

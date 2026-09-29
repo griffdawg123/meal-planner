@@ -99,6 +99,37 @@ func TestClient(t *testing.T) {
 		}
 	})
 
+	t.Run("identifies a token Telegram rejects when getting the bot", func(t *testing.T) {
+		for _, response := range []string{
+			`{"ok":false,"error_code":401,"description":"Unauthorized"}`,
+			`{"ok":false,"error_code":404,"description":"Not Found"}`,
+		} {
+			api := newFakeBotAPI(t, response)
+			client := telegram.NewClient(api.server.URL, testToken, api.server.Client())
+
+			_, err := client.GetMe(context.Background())
+
+			var apiErr *telegram.APIError
+			if !errors.Is(err, telegram.ErrBotTokenRejected) || !errors.As(err, &apiErr) {
+				t.Fatalf("get me with response %s: got %v, want it to wrap %v and an *telegram.APIError", response, err, telegram.ErrBotTokenRejected)
+			}
+			if strings.Contains(err.Error(), testToken) {
+				t.Fatalf("error: got %q, want it not to contain the bot token", err)
+			}
+		}
+	})
+
+	t.Run("does not blame the token for other failures getting the bot", func(t *testing.T) {
+		api := newFakeBotAPI(t, `{"ok":false,"error_code":500,"description":"Internal Server Error"}`)
+		client := telegram.NewClient(api.server.URL, testToken, api.server.Client())
+
+		_, err := client.GetMe(context.Background())
+
+		if err == nil || errors.Is(err, telegram.ErrBotTokenRejected) {
+			t.Fatalf("get me: got %v, want an error that does not wrap %v", err, telegram.ErrBotTokenRejected)
+		}
+	})
+
 	t.Run("deletes any webhook so updates can be long polled, keeping pending updates", func(t *testing.T) {
 		api := newFakeBotAPI(t, `{"ok":true,"result":true}`)
 		client := telegram.NewClient(api.server.URL, testToken, api.server.Client())

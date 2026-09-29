@@ -3,7 +3,10 @@ package telegram_test
 import (
 	"context"
 	"errors"
+	"log"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +101,63 @@ func TestPoller(t *testing.T) {
 		}
 		if len(reported) != 1 || !errors.Is(reported[0], pollErr) {
 			t.Errorf("reported errors: got %v, want [%v]", reported, pollErr)
+		}
+	})
+
+	t.Run("reports recovery with the number of failed polls once a poll succeeds again", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		pollErr := errors.New("connection reset")
+		source := &scriptedUpdates{
+			batches:  [][]telegram.Update{nil, nil, nil, nil, nil},
+			failures: map[int]error{1: pollErr, 2: pollErr, 4: pollErr},
+			whenDone: cancel,
+		}
+		var recoveries []int
+		poller := &telegram.Poller{
+			Updates:    source,
+			Handler:    telegram.HandlerFunc(func(context.Context, telegram.Update) error { return nil }),
+			RetryDelay: time.Millisecond,
+			OnError:    func(error) {},
+			OnRecover:  func(failedPolls int) { recoveries = append(recoveries, failedPolls) },
+		}
+
+		poller.Run(ctx)
+
+		if want := []int{2}; !reflect.DeepEqual(recoveries, want) {
+			t.Errorf("recoveries: got %v, want %v", recoveries, want)
+		}
+	})
+
+	t.Run("logs failures and recovery when no hooks are set", func(t *testing.T) {
+		var logged strings.Builder
+		log.SetOutput(&logged)
+		flags := log.Flags()
+		log.SetFlags(0)
+		t.Cleanup(func() {
+			log.SetOutput(os.Stderr)
+			log.SetFlags(flags)
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		source := &scriptedUpdates{
+			batches:  [][]telegram.Update{nil, {{UpdateID: 3}}},
+			failures: map[int]error{0: errors.New("connection reset")},
+			whenDone: cancel,
+		}
+		poller := &telegram.Poller{
+			Updates:    source,
+			Handler:    telegram.HandlerFunc(func(context.Context, telegram.Update) error { return errors.New("reply failed") }),
+			RetryDelay: time.Millisecond,
+		}
+
+		poller.Run(ctx)
+
+		want := "poll telegram updates: connection reset\n" +
+			"telegram polling recovered after 1 failed poll(s)\n" +
+			"handle telegram update 3: reply failed\n"
+		if logged.String() != want {
+			t.Errorf("log: got %q, want %q", logged.String(), want)
 		}
 	})
 
