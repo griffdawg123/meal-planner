@@ -182,6 +182,20 @@ func TestTelegramBlockedMutations(t *testing.T) {
 			t.Errorf("away nights: got %+v, want %+v", stored, want)
 		}
 	})
+
+	t.Run("confirming a plan before the workflow can generate recipes never promises them", func(t *testing.T) {
+		application, sender, _, _ := newLinkedHousehold(t)
+
+		err := application.Commands.ConfirmPlan(context.Background(), 1001)
+		if !errors.Is(err, app.ErrPlanConfirmationUnavailable) {
+			t.Errorf("confirm plan: got %v, want it to wrap %v", err, app.ErrPlanConfirmationUnavailable)
+		}
+
+		want := []sentMessage{{ChatID: 1001, Text: telegram.ErrorReply(app.ErrPlanConfirmationUnavailable), ParseMode: telegram.ParseMode}}
+		if !reflect.DeepEqual(sender.sent, want) {
+			t.Fatalf("sent messages: got %+v, want %+v", sender.sent, want)
+		}
+	})
 }
 
 type sentMessage struct {

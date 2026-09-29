@@ -25,7 +25,7 @@ func TestCommandsMarkAway(t *testing.T) {
 	t.Run("records the away nights of a member of the user's household and confirms", func(t *testing.T) {
 		households := &recordingHouseholds{members: map[string]string{"member-2": "household-1"}}
 		sender := &recordingSender{}
-		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, sender)
+		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, &recordingConfirmations{}, sender)
 
 		if err := commands.MarkAway(context.Background(), 1001, "member-2", "2026-10-05"); err != nil {
 			t.Fatalf("mark away: got %v, want nil", err)
@@ -44,7 +44,7 @@ func TestCommandsMarkAway(t *testing.T) {
 	t.Run("never records away nights for a member of another household and tells the user why", func(t *testing.T) {
 		households := &recordingHouseholds{members: map[string]string{"member-9": "household-9"}}
 		sender := &recordingSender{}
-		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, sender)
+		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, &recordingConfirmations{}, sender)
 
 		err := commands.MarkAway(context.Background(), 1001, "member-9", "2026-10-05")
 		if !errors.Is(err, household.ErrPermissionDenied) {
@@ -59,7 +59,7 @@ func TestCommandsMarkAway(t *testing.T) {
 	t.Run("never records anything for an unlinked Telegram user and tells them to link", func(t *testing.T) {
 		households := &recordingHouseholds{members: map[string]string{"member-1": "household-1"}}
 		sender := &recordingSender{}
-		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, sender)
+		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, &recordingConfirmations{}, sender)
 
 		err := commands.MarkAway(context.Background(), 4040, "member-1", "2026-10-05")
 		if !errors.Is(err, auth.ErrTelegramNotLinked) {
@@ -75,7 +75,7 @@ func TestCommandsMarkAway(t *testing.T) {
 		households := &recordingHouseholds{members: map[string]string{"member-9": "household-9"}}
 		sendErr := errors.New("bot was blocked by the user")
 		sender := &recordingSender{failFor: map[int64]error{1001: sendErr}}
-		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, sender)
+		commands := telegram.NewCommands(identities, households, &recordingDraftPlans{}, &recordingConfirmations{}, sender)
 
 		err := commands.MarkAway(context.Background(), 1001, "member-9", "2026-10-05")
 		if !errors.Is(err, household.ErrPermissionDenied) || !errors.Is(err, sendErr) {
@@ -92,7 +92,7 @@ func TestCommandsReplaceDinner(t *testing.T) {
 	t.Run("revises the dinner in the user's own household", func(t *testing.T) {
 		drafts := &recordingDraftPlans{}
 		sender := &recordingSender{}
-		commands := telegram.NewCommands(identities, &recordingHouseholds{}, drafts, sender)
+		commands := telegram.NewCommands(identities, &recordingHouseholds{}, drafts, &recordingConfirmations{}, sender)
 
 		if err := commands.ReplaceDinner(context.Background(), 1001, "2026-10-05", padThai); err != nil {
 			t.Fatalf("replace dinner: got %v, want nil", err)
@@ -111,7 +111,7 @@ func TestCommandsReplaceDinner(t *testing.T) {
 	t.Run("tells the user a dinner breaking an allergy was blocked", func(t *testing.T) {
 		drafts := &recordingDraftPlans{blocked: map[string]bool{"Satay chicken": true}}
 		sender := &recordingSender{}
-		commands := telegram.NewCommands(identities, &recordingHouseholds{}, drafts, sender)
+		commands := telegram.NewCommands(identities, &recordingHouseholds{}, drafts, &recordingConfirmations{}, sender)
 
 		err := commands.ReplaceDinner(context.Background(), 1001, "2026-10-05", satay)
 		if !errors.Is(err, household.ErrHardConstraint) {
@@ -126,7 +126,7 @@ func TestCommandsReplaceDinner(t *testing.T) {
 	t.Run("never revises a dinner for an unlinked Telegram user", func(t *testing.T) {
 		drafts := &recordingDraftPlans{}
 		sender := &recordingSender{}
-		commands := telegram.NewCommands(identities, &recordingHouseholds{}, drafts, sender)
+		commands := telegram.NewCommands(identities, &recordingHouseholds{}, drafts, &recordingConfirmations{}, sender)
 
 		err := commands.ReplaceDinner(context.Background(), 4040, "2026-10-05", padThai)
 		if !errors.Is(err, auth.ErrTelegramNotLinked) {
@@ -136,6 +136,57 @@ func TestCommandsReplaceDinner(t *testing.T) {
 			t.Errorf("revised dinners: got %+v, want none", drafts.revised)
 		}
 		assertRepliedWith(t, sender, 4040, auth.ErrTelegramNotLinked)
+	})
+}
+
+func TestCommandsConfirmPlan(t *testing.T) {
+	identities := fakeIdentities{1001: {HouseholdID: "household-1", MemberID: "member-1"}}
+
+	t.Run("confirms the user's household's plan and tells them the recipes and shopping list are on the way", func(t *testing.T) {
+		confirmations := &recordingConfirmations{}
+		sender := &recordingSender{}
+		commands := telegram.NewCommands(identities, &recordingHouseholds{}, &recordingDraftPlans{}, confirmations, sender)
+
+		if err := commands.ConfirmPlan(context.Background(), 1001); err != nil {
+			t.Fatalf("confirm plan: got %v, want nil", err)
+		}
+
+		want := []confirmCall{{HouseholdID: "household-1", MemberID: "member-1"}}
+		if !reflect.DeepEqual(confirmations.confirmed, want) {
+			t.Errorf("confirmed plans: got %+v, want %+v", confirmations.confirmed, want)
+		}
+		wantSent := []sentMessage{{ChatID: 1001, Text: telegram.PlanConfirmedReply, ParseMode: telegram.ParseMode}}
+		if !reflect.DeepEqual(sender.sent, wantSent) {
+			t.Errorf("sent messages: got %+v, want %+v", sender.sent, wantSent)
+		}
+	})
+
+	t.Run("never confirms a plan for an unlinked Telegram user and tells them to link", func(t *testing.T) {
+		confirmations := &recordingConfirmations{}
+		sender := &recordingSender{}
+		commands := telegram.NewCommands(identities, &recordingHouseholds{}, &recordingDraftPlans{}, confirmations, sender)
+
+		err := commands.ConfirmPlan(context.Background(), 4040)
+		if !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Errorf("confirm plan: got %v, want it to wrap %v", err, auth.ErrTelegramNotLinked)
+		}
+		if len(confirmations.confirmed) != 0 {
+			t.Errorf("confirmed plans: got %+v, want none", confirmations.confirmed)
+		}
+		assertRepliedWith(t, sender, 4040, auth.ErrTelegramNotLinked)
+	})
+
+	t.Run("does not acknowledge a confirmation the planning workflow rejected", func(t *testing.T) {
+		confirmErr := fmt.Errorf("%w: no draft plan to confirm", household.ErrInvalidInput)
+		confirmations := &recordingConfirmations{err: confirmErr}
+		sender := &recordingSender{}
+		commands := telegram.NewCommands(identities, &recordingHouseholds{}, &recordingDraftPlans{}, confirmations, sender)
+
+		err := commands.ConfirmPlan(context.Background(), 1001)
+		if !errors.Is(err, confirmErr) {
+			t.Errorf("confirm plan: got %v, want it to wrap %v", err, confirmErr)
+		}
+		assertRepliedWith(t, sender, 1001, confirmErr)
 	})
 }
 
@@ -207,5 +258,25 @@ func (d *recordingDraftPlans) ReviseDinner(_ context.Context, householdID, night
 		return fmt.Errorf("%w: %q on %s", household.ErrHardConstraint, meal.Title, night)
 	}
 	d.revised = append(d.revised, dinnerCall{HouseholdID: householdID, Night: night, Meal: meal})
+	return nil
+}
+
+type confirmCall struct {
+	HouseholdID string
+	MemberID    string
+}
+
+// recordingConfirmations rejects every confirmation with err when it is set, and otherwise records
+// every confirmation that reaches it.
+type recordingConfirmations struct {
+	err       error
+	confirmed []confirmCall
+}
+
+func (c *recordingConfirmations) ConfirmPlan(_ context.Context, householdID, memberID string) error {
+	if c.err != nil {
+		return c.err
+	}
+	c.confirmed = append(c.confirmed, confirmCall{HouseholdID: householdID, MemberID: memberID})
 	return nil
 }
