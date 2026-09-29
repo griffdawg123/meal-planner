@@ -126,44 +126,6 @@ CREATE TABLE IF NOT EXISTS magic_link (
         ON DELETE CASCADE
 );
 
--- Lifecycle rules live in triggers rather than CHECK constraints because
--- CREATE TABLE IF NOT EXISTS cannot add constraints to an existing table,
--- whereas these triggers are installed on existing databases as well.
-CREATE TRIGGER IF NOT EXISTS magic_link_valid_insert
-BEFORE INSERT ON magic_link
-WHEN typeof(NEW.created_at) <> 'integer'
-    OR typeof(NEW.expires_at) <> 'integer'
-    OR NEW.expires_at <= NEW.created_at
-    OR (NEW.used_at IS NOT NULL AND (
-        typeof(NEW.used_at) <> 'integer'
-        OR NEW.used_at < NEW.created_at
-        OR NEW.used_at >= NEW.expires_at
-    ))
-BEGIN
-    SELECT RAISE(ABORT, 'invalid magic link lifecycle');
-END;
-
-CREATE TRIGGER IF NOT EXISTS magic_link_valid_update
-BEFORE UPDATE ON magic_link
-WHEN typeof(NEW.created_at) <> 'integer'
-    OR typeof(NEW.expires_at) <> 'integer'
-    OR NEW.expires_at <= NEW.created_at
-    OR (NEW.used_at IS NOT NULL AND (
-        typeof(NEW.used_at) <> 'integer'
-        OR NEW.used_at < NEW.created_at
-        OR NEW.used_at >= NEW.expires_at
-    ))
-BEGIN
-    SELECT RAISE(ABORT, 'invalid magic link lifecycle');
-END;
-
-CREATE TRIGGER IF NOT EXISTS magic_link_single_use
-BEFORE UPDATE OF used_at ON magic_link
-WHEN OLD.used_at IS NOT NULL
-BEGIN
-    SELECT RAISE(ABORT, 'magic link has already been used');
-END;
-
 CREATE TABLE IF NOT EXISTS web_session (
     token_hash BLOB PRIMARY KEY
                     CHECK (length(token_hash) = 32),

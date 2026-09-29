@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"os"
 	"testing"
 
 	mealdb "github.com/griffdawg123/meal-planner/db"
@@ -182,6 +183,35 @@ func TestMagicLinkSchema(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects timestamps that are not integers", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		for _, values := range [][2]any{
+			{"never", 200},
+			{100, "never"},
+			{100, 200.5},
+		} {
+			if _, err := database.Exec(
+				`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+				tokenHash(1), "member-1", values[0], values[1],
+			); err == nil {
+				t.Errorf("insert created_at=%v expires_at=%v: got nil error, want error", values[0], values[1])
+			}
+		}
+
+		insertMagicLink(t, database, tokenHash(2), "member-1", 100, 200)
+		for _, statement := range []string{
+			`UPDATE magic_link SET expires_at = 'never'`,
+			`UPDATE magic_link SET used_at = 'never'`,
+			`UPDATE magic_link SET used_at = 150.5`,
+		} {
+			if _, err := database.Exec(statement); err == nil {
+				t.Errorf("%s: got nil error, want error", statement)
+			}
+		}
+	})
+
 	t.Run("deleting a member cascades to its magic links", func(t *testing.T) {
 		database := newTestDatabase(t)
 		insertHousehold(t, database, "household-1", "member-1")
@@ -258,7 +288,63 @@ func TestApplySchemaCanBeReapplied(t *testing.T) {
 	}
 }
 
+func TestApplySchemaUpgradesMagicLinkLifecycle(t *testing.T) {
+	// The fixture is the schema as released before the magic-link lifecycle
+	// rules, so existing databases must gain them when the schema is reapplied.
+	legacySchema, err := os.ReadFile("testdata/schema_before_magic_link_lifecycle.sql")
+	if err != nil {
+		t.Fatalf("read legacy schema: %v", err)
+	}
+	database := openTestDatabase(t)
+	if _, err := database.Exec(string(legacySchema)); err != nil {
+		t.Fatalf("apply legacy schema: %v", err)
+	}
+	insertHousehold(t, database, "household-1", "member-1")
+	insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("upgrade schema: %v", err)
+	}
+
+	for _, statement := range []string{
+		`UPDATE magic_link SET used_at = 201`,
+		`UPDATE magic_link SET used_at = 99`,
+		`UPDATE magic_link SET expires_at = 'never'`,
+	} {
+		if _, err := database.Exec(statement); err == nil {
+			t.Errorf("%s: got nil error, want error", statement)
+		}
+	}
+	if err := execMagicLink(database, tokenHash(2), "member-1", 100, 200); err != nil {
+		t.Fatalf("insert magic link after upgrade: got %v, want nil", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		tokenHash(3), "member-1", 100, "never",
+	); err == nil {
+		t.Error("insert non-expiring magic link after upgrade: got nil error, want error")
+	}
+
+	if _, err := database.Exec(`UPDATE magic_link SET used_at = 150 WHERE token_hash = ?`, tokenHash(1)); err != nil {
+		t.Fatalf("consume magic link after upgrade: got %v, want nil", err)
+	}
+	if _, err := database.Exec(`UPDATE magic_link SET used_at = NULL WHERE token_hash = ?`, tokenHash(1)); err == nil {
+		t.Error("reset consumed magic link after upgrade: got nil error, want error")
+	}
+}
+
 func newTestDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+
+	database := openTestDatabase(t)
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+
+	return database
+}
+
+func openTestDatabase(t *testing.T) *sql.DB {
 	t.Helper()
 
 	database, err := sql.Open("sqlite", ":memory:")
@@ -271,10 +357,6 @@ func newTestDatabase(t *testing.T) *sql.DB {
 			t.Errorf("close database: %v", err)
 		}
 	})
-
-	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
-		t.Fatalf("apply schema: %v", err)
-	}
 
 	return database
 }

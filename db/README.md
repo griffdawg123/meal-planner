@@ -75,11 +75,16 @@ the raw token is returned to the caller for delivery or use and cannot be recove
 database. Their timestamps are Unix seconds so expiry checks are direct integer comparisons.
 
 A magic link belongs to exactly one member, and the schema itself enforces its lifecycle rather
-than leaving it to the service. `expires_at` must be after `created_at`. `used_at` is `NULL` until
-the link is consumed, and it may only be set within the link's lifetime:
+than leaving it to the service. All three timestamps must be stored as integers (SQLite does not
+enforce column types, and a TEXT `expires_at` would compare greater than every integer `now`,
+creating a link that never expires). `expires_at` must be after `created_at`. `used_at` is `NULL`
+until the link is consumed, and it may only be set within the link's lifetime:
 `created_at <= used_at < expires_at`, which matches the service's strict `expires_at > now` check.
-The `magic_link_single_use` trigger rejects any update to `used_at` once it is set, so a consumed
-link cannot be reset or consumed again. Expired or used rows are inert and may be pruned at any
+The `magic_link_valid_insert` and `magic_link_valid_update` triggers enforce these rules, and the
+`magic_link_single_use` trigger rejects any update to `used_at` once it is set, so a consumed link
+cannot be reset or consumed again. The rules are triggers rather than `CHECK` constraints so that
+reapplying the schema installs them on existing databases too; `CREATE TABLE IF NOT EXISTS` cannot
+add constraints to a table that already exists. Expired or used rows are inert and may be pruned at any
 time. All
 three tables cascade on member deletion so removed members immediately lose their web identities,
 unused links, and sessions.
