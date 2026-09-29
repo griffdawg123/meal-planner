@@ -104,6 +104,23 @@ func TestFormatDraftPlan(t *testing.T) {
 		}
 	})
 
+	t.Run("counts Unicode code points, not UTF-16 code units, against the limit", func(t *testing.T) {
+		// An emoji outside the Basic Multilingual Plane is two UTF-16 code units but one code
+		// point, and Telegram's length limit counts code points.
+		description := strings.Repeat("a", descriptionBudget-1) + "🍜"
+		got, err := telegram.FormatDraftPlan([]telegram.DraftDinner{
+			{Night: "2026-10-05", Title: "Pad thai", Description: description},
+		})
+		if err != nil {
+			t.Fatalf("format draft plan: got %v, want nil", err)
+		}
+
+		want := "<b>Draft dinner plan</b>\n\n<b>Mon 5 Oct: Pad thai</b>\n" + description
+		if got != want {
+			t.Fatalf("message: got %q, want %q", got, want)
+		}
+	})
+
 	t.Run("does not count HTML markup or escapes against the limit", func(t *testing.T) {
 		_, err := telegram.FormatDraftPlan([]telegram.DraftDinner{
 			{Night: "2026-10-05", Title: "Pad thai", Description: strings.Repeat("&", descriptionBudget)},
@@ -120,9 +137,7 @@ func TestFormatDraftPlan(t *testing.T) {
 		}{
 			{name: "one character over", description: strings.Repeat("a", descriptionBudget+1)},
 			{name: "description alone at the limit", description: strings.Repeat("a", telegram.MaxMessageLength)},
-			// Telegram measures text in UTF-16 code units, where an emoji outside the Basic
-			// Multilingual Plane counts as two.
-			{name: "over only when counted in UTF-16 code units", description: strings.Repeat("a", descriptionBudget-1) + "🍜"},
+			{name: "one emoji over", description: strings.Repeat("a", descriptionBudget) + "🍜"},
 		}
 		for _, test := range tests {
 			t.Run(test.name, func(t *testing.T) {

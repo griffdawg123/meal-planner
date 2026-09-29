@@ -7,7 +7,7 @@ import (
 	"html"
 	"strings"
 	"time"
-	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // ParseMode is the Telegram Bot API parse_mode that messages from this package must be sent with.
@@ -17,7 +17,7 @@ const ParseMode = "HTML"
 const nightLayout = "2006-01-02"
 
 // MaxMessageLength is the Telegram Bot API limit on a message's text after entity parsing, in
-// UTF-16 code units.
+// Unicode code points.
 const MaxMessageLength = 4096
 
 // ErrInvalidDraft identifies a draft plan that cannot be formatted as a message.
@@ -64,7 +64,7 @@ func FormatDraftPlan(dinners []DraftDinner) (string, error) {
 		fmt.Fprintf(&message, "\n\n<b>%s%s</b>\n%s", heading, html.EscapeString(title), html.EscapeString(description))
 		fmt.Fprintf(&visible, "\n\n%s%s\n%s", heading, title, description)
 	}
-	if length := len(utf16.Encode([]rune(visible.String()))); length > MaxMessageLength {
+	if length := utf8.RuneCountInString(visible.String()); length > MaxMessageLength {
 		return "", fmt.Errorf("%w: %d characters, limit %d", ErrMessageTooLong, length, MaxMessageLength)
 	}
 	return message.String(), nil
