@@ -3,11 +3,13 @@ package app_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"reflect"
 	"sort"
 	"testing"
 
 	"github.com/griffdawg123/meal-planner/app"
+	"github.com/griffdawg123/meal-planner/auth"
 	mealdb "github.com/griffdawg123/meal-planner/db"
 	"github.com/griffdawg123/meal-planner/household"
 	"github.com/griffdawg123/meal-planner/telegram"
@@ -71,6 +73,113 @@ func TestDraftPlanDelivery(t *testing.T) {
 		}
 		if !reflect.DeepEqual(sender.sent, want) {
 			t.Fatalf("sent messages: got %+v, want %+v", sender.sent, want)
+		}
+	})
+}
+
+func TestTelegramBlockedMutations(t *testing.T) {
+	// newLinkedHousehold composes the application and creates a household whose founder, linked as
+	// Telegram user 1001, is allergic to peanuts, alongside another household linked as user 2001.
+	newLinkedHousehold := func(t *testing.T) (*app.App, *recordingSender, household.Household, household.Household) {
+		t.Helper()
+		ctx := context.Background()
+		sender := &recordingSender{}
+		application := app.New(newTestDatabase(t), sender)
+
+		created, err := application.Households.CreateHousehold(ctx, "Household", "Australia/Sydney", "Founder")
+		if err != nil {
+			t.Fatalf("create household: %v", err)
+		}
+		if _, err := application.Households.AddPreference(ctx, created.ID, created.CreatorID, sql.NullInt16{}, "peanuts", household.Allergy, household.Hard); err != nil {
+			t.Fatalf("add founder allergy: %v", err)
+		}
+		other, err := application.Households.CreateHousehold(ctx, "Other Household", "Australia/Sydney", "Other Founder")
+		if err != nil {
+			t.Fatalf("create other household: %v", err)
+		}
+		for telegramUserID, member := range map[int64]household.Household{1001: created, 2001: other} {
+			code, err := application.Auth.RequestTelegramLinkCode(ctx, member.ID, member.CreatorID)
+			if err != nil {
+				t.Fatalf("request telegram link code: %v", err)
+			}
+			if _, err := application.Auth.LinkTelegram(ctx, telegramUserID, code); err != nil {
+				t.Fatalf("link telegram: %v", err)
+			}
+		}
+		return application, sender, created, other
+	}
+
+	t.Run("a dinner that breaks a present member's allergy is never sent to the household and the member is told why", func(t *testing.T) {
+		application, sender, _, _ := newLinkedHousehold(t)
+		satay := household.Meal{Title: "Satay chicken", Description: "Chicken skewers with peanut sauce.", Conflicts: []string{"peanuts"}}
+
+		err := application.Commands.ReplaceDinner(context.Background(), 1001, "2026-10-05", satay)
+		if !errors.Is(err, household.ErrHardConstraint) {
+			t.Errorf("replace dinner: got %v, want it to wrap %v", err, household.ErrHardConstraint)
+		}
+
+		want := []sentMessage{{ChatID: 1001, Text: telegram.ErrorReply(household.ErrHardConstraint), ParseMode: telegram.ParseMode}}
+		if !reflect.DeepEqual(sender.sent, want) {
+			t.Fatalf("sent messages: got %+v, want %+v", sender.sent, want)
+		}
+	})
+
+	t.Run("marking a member of another household away stores nothing and the member is told why", func(t *testing.T) {
+		application, sender, _, other := newLinkedHousehold(t)
+
+		err := application.Commands.MarkAway(context.Background(), 1001, other.CreatorID, "2026-10-05")
+		if !errors.Is(err, household.ErrPermissionDenied) {
+			t.Errorf("mark away: got %v, want it to wrap %v", err, household.ErrPermissionDenied)
+		}
+
+		stored, err := application.Households.ListAwayNights(context.Background(), other.ID, "2026-10-01", "2026-10-31")
+		if err != nil {
+			t.Fatalf("list other household away nights: %v", err)
+		}
+		if len(stored) != 0 {
+			t.Errorf("other household away nights: got %+v, want none", stored)
+		}
+		want := []sentMessage{{ChatID: 1001, Text: telegram.ErrorReply(household.ErrPermissionDenied), ParseMode: telegram.ParseMode}}
+		if !reflect.DeepEqual(sender.sent, want) {
+			t.Fatalf("sent messages: got %+v, want %+v", sender.sent, want)
+		}
+	})
+
+	t.Run("an unlinked Telegram user stores nothing and is told to link first", func(t *testing.T) {
+		application, sender, created, _ := newLinkedHousehold(t)
+
+		err := application.Commands.MarkAway(context.Background(), 4040, created.CreatorID, "2026-10-05")
+		if !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Errorf("mark away: got %v, want it to wrap %v", err, auth.ErrTelegramNotLinked)
+		}
+
+		stored, err := application.Households.ListAwayNights(context.Background(), created.ID, "2026-10-01", "2026-10-31")
+		if err != nil {
+			t.Fatalf("list away nights: %v", err)
+		}
+		if len(stored) != 0 {
+			t.Errorf("away nights: got %+v, want none", stored)
+		}
+		want := []sentMessage{{ChatID: 4040, Text: telegram.ErrorReply(auth.ErrTelegramNotLinked), ParseMode: telegram.ParseMode}}
+		if !reflect.DeepEqual(sender.sent, want) {
+			t.Fatalf("sent messages: got %+v, want %+v", sender.sent, want)
+		}
+	})
+
+	t.Run("a permitted change within the member's own household is stored", func(t *testing.T) {
+		application, _, created, _ := newLinkedHousehold(t)
+
+		if err := application.Commands.MarkAway(context.Background(), 1001, created.CreatorID, "2026-10-05"); err != nil {
+			t.Fatalf("mark away: got %v, want nil", err)
+		}
+
+		stored, err := application.Households.ListAwayNights(context.Background(), created.ID, "2026-10-01", "2026-10-31")
+		if err != nil {
+			t.Fatalf("list away nights: %v", err)
+		}
+		want := []household.AwayNight{{HouseholdID: created.ID, MemberID: created.CreatorID, Night: "2026-10-05"}}
+		if !reflect.DeepEqual(stored, want) {
+			t.Errorf("away nights: got %+v, want %+v", stored, want)
 		}
 	})
 }

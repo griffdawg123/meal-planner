@@ -44,3 +44,26 @@ func (p *Planner) CreateDraftPlan(ctx context.Context, householdID string, night
 	}
 	return dinners, nil
 }
+
+// ReviseDinner replaces one night's dinner with meal, as when a member asks for a different dinner,
+// and publishes the revised night to every subscriber. The household's preferences for that night
+// are resolved first, and a meal that breaks any hard constraint of a member present that night
+// yields ErrHardConstraint without anything being published.
+func (p *Planner) ReviseDinner(ctx context.Context, householdID, night string, meal Meal) error {
+	preferences, err := p.households.NightPreferences(ctx, householdID, night)
+	if err != nil {
+		return err
+	}
+	if blocked(meal, preferences.HardConstraints) {
+		return fmt.Errorf("%w: %q on %s", ErrHardConstraint, meal.Title, night)
+	}
+
+	event := DraftPlanCreated{
+		HouseholdID: householdID,
+		Dinners:     []DraftDinner{{Night: night, Title: meal.Title, Description: meal.Description}},
+	}
+	if err := p.events.Publish(ctx, event); err != nil {
+		return fmt.Errorf("publish revised dinner for household %q: %w", householdID, err)
+	}
+	return nil
+}
