@@ -112,8 +112,8 @@ CREATE TABLE IF NOT EXISTS web_identity (
 );
 
 CREATE TABLE IF NOT EXISTS magic_link (
-    token_hash BLOB PRIMARY KEY
-                    CHECK (length(token_hash) = 32),
+    token_hash BLOB NOT NULL PRIMARY KEY
+                    CHECK (typeof(token_hash) = 'blob' AND length(token_hash) = 32),
     member_id  TEXT NOT NULL
                     CHECK (member_id <> ''),
     created_at INTEGER NOT NULL,
@@ -131,7 +131,9 @@ CREATE TABLE IF NOT EXISTS magic_link (
 -- whereas these triggers are installed on existing databases as well.
 CREATE TRIGGER IF NOT EXISTS magic_link_valid_insert
 BEFORE INSERT ON magic_link
-WHEN typeof(NEW.created_at) <> 'integer'
+WHEN typeof(NEW.token_hash) <> 'blob'
+    OR length(NEW.token_hash) <> 32
+    OR typeof(NEW.created_at) <> 'integer'
     OR typeof(NEW.expires_at) <> 'integer'
     OR NEW.expires_at <= NEW.created_at
     OR (NEW.used_at IS NOT NULL AND (
@@ -145,7 +147,9 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS magic_link_valid_update
 BEFORE UPDATE ON magic_link
-WHEN typeof(NEW.created_at) <> 'integer'
+WHEN typeof(NEW.token_hash) <> 'blob'
+    OR length(NEW.token_hash) <> 32
+    OR typeof(NEW.created_at) <> 'integer'
     OR typeof(NEW.expires_at) <> 'integer'
     OR NEW.expires_at <= NEW.created_at
     OR (NEW.used_at IS NOT NULL AND (

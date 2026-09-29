@@ -75,7 +75,8 @@ the raw token is returned to the caller for delivery or use and cannot be recove
 database. Their timestamps are Unix seconds so expiry checks are direct integer comparisons.
 
 A magic link belongs to exactly one member, and the schema itself enforces its lifecycle rather
-than leaving it to the service. All three timestamps must be stored as integers (SQLite does not
+than leaving it to the service. `token_hash` must be a non-NULL 32-byte BLOB (SQLite allows NULL
+in non-integer primary keys, and `length()` would accept a 32-character TEXT value). All three timestamps must be stored as integers (SQLite does not
 enforce column types, and a TEXT `expires_at` would compare greater than every integer `now`,
 creating a link that never expires). `expires_at` must be after `created_at`. `used_at` is `NULL`
 until the link is consumed, and it may only be set within the link's lifetime:

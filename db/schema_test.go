@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"os"
+	"strings"
 	"testing"
 
 	mealdb "github.com/griffdawg123/meal-planner/db"
@@ -114,6 +115,13 @@ func TestMagicLinkSchema(t *testing.T) {
 		if err := execMagicLink(database, []byte("raw-token"), "member-1", 100, 200); err == nil {
 			t.Fatal("insert accepted a non-digest token hash: got nil error, want error")
 		}
+	})
+
+	t.Run("rejects a token hash that is null or not a blob", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		assertTokenHashRequired(t, database)
 	})
 
 	t.Run("rejects a link that expires before it is created", func(t *testing.T) {
@@ -324,6 +332,7 @@ func TestApplySchemaUpgradesMagicLinkLifecycle(t *testing.T) {
 	); err == nil {
 		t.Error("insert non-expiring magic link after upgrade: got nil error, want error")
 	}
+	assertTokenHashRequired(t, database)
 
 	if _, err := database.Exec(`UPDATE magic_link SET used_at = 150 WHERE token_hash = ?`, tokenHash(1)); err != nil {
 		t.Fatalf("consume magic link after upgrade: got %v, want nil", err)
@@ -396,11 +405,51 @@ func insertMagicLink(t *testing.T, database *sql.DB, hash []byte, memberID strin
 }
 
 func execMagicLink(database *sql.DB, hash []byte, memberID string, createdAt, expiresAt int64) error {
+	return execMagicLinkValue(database, hash, memberID, createdAt, expiresAt)
+}
+
+func execMagicLinkValue(database *sql.DB, hash any, memberID string, createdAt, expiresAt int64) error {
 	_, err := database.Exec(
 		`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
 		hash, memberID, createdAt, expiresAt,
 	)
 	return err
+}
+
+// assertTokenHashRequired checks that magic links cannot be stored or updated
+// with a token hash that is NULL or a 32-character string rather than a
+// 32-byte digest. The database must contain member-1.
+func assertTokenHashRequired(t *testing.T, database *sql.DB) {
+	t.Helper()
+
+	textHash := strings.Repeat("a", 32)
+	for _, hash := range []any{nil, textHash} {
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := execMagicLinkValue(database, hash, "member-1", 100, 200); err == nil {
+				t.Errorf("insert token_hash=%v (attempt %d): got nil error, want error", hash, attempt+1)
+			}
+		}
+	}
+
+	valid := tokenHash(99)
+	insertMagicLink(t, database, valid, "member-1", 100, 200)
+	for _, hash := range []any{nil, textHash} {
+		if _, err := database.Exec(
+			`UPDATE magic_link SET token_hash = ? WHERE token_hash = ?`, hash, valid,
+		); err == nil {
+			t.Errorf("update token_hash to %v: got nil error, want error", hash)
+		}
+	}
+
+	var invalid int
+	if err := database.QueryRow(
+		`SELECT count(*) FROM magic_link WHERE typeof(token_hash) <> 'blob' OR length(token_hash) <> 32`,
+	).Scan(&invalid); err != nil {
+		t.Fatalf("count invalid token hashes: %v", err)
+	}
+	if invalid != 0 {
+		t.Errorf("magic links with invalid token hashes: got %d, want 0", invalid)
+	}
 }
 
 // tokenHash returns a distinct 32-byte value shaped like a SHA-256 digest.
