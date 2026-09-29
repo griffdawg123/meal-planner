@@ -49,6 +49,7 @@ go run ./cmd/meal-planner -db /path/to/meal-planner.db
    webhook when it starts. Only one process may poll with a token at a time; if Telegram reports
    a conflict, the application exits with an explanation instead of retrying.
 4. Message the bot `/ping` and it replies `pong`; `/echo some text` replies with the same text.
-   These confirm the connection works end to end.
+   These confirm the connection works end to end. If Telegram rate limits a reply, the bot waits
+   as long as Telegram asks and resends it, up to three times.
 
 Without a token, the application initializes the database and exits without starting the bot.

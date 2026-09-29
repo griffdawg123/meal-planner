@@ -132,6 +132,22 @@ func TestClient(t *testing.T) {
 		}
 	})
 
+	t.Run("reports how long to wait when Telegram rate limits a request", func(t *testing.T) {
+		api := newFakeBotAPI(t, `{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 3","parameters":{"retry_after":3}}`)
+		client := telegram.NewClient(api.server.URL, testToken, api.server.Client())
+
+		err := client.SendMessage(context.Background(), 1001, "hello", "")
+
+		var apiErr *telegram.APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("error: got %v, want an *telegram.APIError", err)
+		}
+		want := telegram.APIError{Method: "sendMessage", Code: 429, Description: "Too Many Requests: retry after 3", RetryAfter: 3 * time.Second}
+		if *apiErr != want {
+			t.Fatalf("api error: got %+v, want %+v", *apiErr, want)
+		}
+	})
+
 	t.Run("never includes the token in a connection error", func(t *testing.T) {
 		api := newFakeBotAPI(t, `{"ok":true}`)
 		client := telegram.NewClient(api.server.URL, testToken, api.server.Client())

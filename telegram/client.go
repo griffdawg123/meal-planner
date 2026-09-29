@@ -42,11 +42,13 @@ type User struct {
 	Username string `json:"username,omitempty"`
 }
 
-// APIError is an error Telegram returned for a Bot API request.
+// APIError is an error Telegram returned for a Bot API request. RetryAfter is how long Telegram
+// asks the bot to wait before repeating a rate-limited request, or zero if it gave no such advice.
 type APIError struct {
 	Method      string
 	Code        int
 	Description string
+	RetryAfter  time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -134,6 +136,9 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 		Result      json.RawMessage `json:"result"`
 		ErrorCode   int             `json:"error_code"`
 		Description string          `json:"description"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
 		return fmt.Errorf("telegram %s: decode response (HTTP %d): %w", method, response.StatusCode, err)
@@ -143,7 +148,12 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 		if code == 0 {
 			code = response.StatusCode
 		}
-		return &APIError{Method: method, Code: code, Description: envelope.Description}
+		return &APIError{
+			Method:      method,
+			Code:        code,
+			Description: envelope.Description,
+			RetryAfter:  time.Duration(envelope.Parameters.RetryAfter) * time.Second,
+		}
 	}
 	if result != nil {
 		if err := json.Unmarshal(envelope.Result, result); err != nil {
