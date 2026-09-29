@@ -59,9 +59,12 @@ func runBot(ctx context.Context, token string) error {
 	}
 	log.Printf("telegram bot connected: @%s; send it /ping to check the connection", bot.Username)
 
+	sender := &telegram.RetryingSender{Sender: client, MaxRetries: 3}
 	poller := &telegram.Poller{
-		Updates:    client,
-		Handler:    telegram.NewHealthCheck(client, bot.Username),
+		Updates: client,
+		Handler: telegram.Handlers{
+			telegram.NewHealthCheck(sender, bot.Username),
+		},
 		Timeout:    pollTimeout,
 		RetryDelay: 5 * time.Second,
 	}

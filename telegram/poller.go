@@ -32,6 +32,22 @@ func (f HandlerFunc) HandleUpdate(ctx context.Context, update Update) error {
 	return f(ctx, update)
 }
 
+// Handlers passes each update to every one of its handlers in order, so independent features can
+// each receive every incoming message. A failed handler does not stop the rest; every failure is
+// returned together.
+type Handlers []Handler
+
+// HandleUpdate calls each handler with update.
+func (h Handlers) HandleUpdate(ctx context.Context, update Update) error {
+	var failures []error
+	for _, handler := range h {
+		if err := handler.HandleUpdate(ctx, update); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
 // Poller receives updates by long polling and passes each to Handler, in order. Long polling needs
 // no public URL, so it suits self-hosted deployments; it cannot be used while a webhook is set for
 // the bot.
