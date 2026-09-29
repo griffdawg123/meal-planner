@@ -7,6 +7,7 @@ readonly LABEL_IN_PROGRESS="devloop:in-progress"
 readonly LABEL_NEEDS_ATTENTION="devloop:needs-attention"
 readonly LABEL_NO_CHANGES_NEEDED="devloop:no-changes-needed"
 readonly PAUSE_EXIT_CODE=75
+readonly PR_CREATE_ATTEMPTS=3
 
 usage() {
   cat <<'EOF'
@@ -256,6 +257,36 @@ mark_no_changes_needed() {
   printf 'issue #%s needed no changes; closed\n' "$issue_number"
 }
 
+# Prints the number of the open PR for branch, or nothing (lookup errors included — the caller
+# treats both as "not found yet").
+open_pr_number() {
+  local worktree="$1" branch="$2"
+  (cd "$worktree" && gh pr list --head "$branch" --state open --json number -q '.[0].number // empty' 2>/dev/null) || true
+}
+
+# Opens the PR for an already-pushed branch and prints its number. GitHub's API returns transient
+# 5xx errors (a 502 Bad Gateway once stopped the loop right after a successful push), and a create
+# that reported an error may still have gone through, so each attempt looks for an existing PR
+# before creating one rather than retrying the create blindly. gh pr create has no --json/-q of
+# its own, hence the separate lookup for the number.
+open_pr() {
+  local worktree="$1" branch="$2" title="$3" issue_number="$4" attempt number
+  local delay="${DEVLOOP_RETRY_DELAY_SECONDS:-15}"
+
+  for ((attempt = 1; attempt <= PR_CREATE_ATTEMPTS; attempt++)); do
+    (( attempt == 1 )) || sleep "$((delay * (attempt - 1)))"
+    number="$(open_pr_number "$worktree" "$branch")"
+    [[ -z "$number" ]] || { printf '%s\n' "$number"; return 0; }
+    # stdout carries only the PR number back to the caller, so send gh's URL output to stderr.
+    if (cd "$worktree" && gh pr create --title "$title" --body "Closes #$issue_number" --base "$(base_branch)" --head "$branch") >&2; then
+      number="$(open_pr_number "$worktree" "$branch")"
+      [[ -z "$number" ]] || { printf '%s\n' "$number"; return 0; }
+    fi
+    printf 'opening the PR for %s failed (attempt %s of %s)\n' "$branch" "$attempt" "$PR_CREATE_ATTEMPTS" >&2
+  done
+  return 1
+}
+
 # Rewrites the whole resume-state file from run_one_cycle's locals (bash's dynamic scoping
 # makes them visible here). Written to a temp file and renamed so an interruption never
 # leaves a half-written state file for the next run to source.
@@ -436,12 +467,8 @@ run_one_cycle() {
 Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit failed"; rm -f "$state_dir/current"; return 1; }
     (cd "$worktree" && git push -u "$GITHUB_REMOTE" "$branch") ||
       { mark_needs_attention "$issue_number" "git push failed"; rm -f "$state_dir/current"; return 1; }
-    # gh pr create has no --json/-q of its own (only gh pr view/list do); fetch the number
-    # with a follow-up gh pr view instead of assuming every gh subcommand supports --json.
-    (cd "$worktree" && gh pr create --title "$title" --body "Closes #$issue_number" --base "$(base_branch)" --head "$branch") ||
-      { mark_needs_attention "$issue_number" "gh pr create failed"; rm -f "$state_dir/current"; return 1; }
-    pr_number="$(cd "$worktree" && gh pr view "$branch" --json number -q .number)" ||
-      { mark_needs_attention "$issue_number" "failed to read the number of the PR just created"; rm -f "$state_dir/current"; return 1; }
+    pr_number="$(open_pr "$worktree" "$branch" "$title" "$issue_number")" ||
+      { mark_needs_attention "$issue_number" "could not open a PR for branch $branch after $PR_CREATE_ATTEMPTS attempts (the branch is pushed; open the PR by hand)"; rm -f "$state_dir/current"; return 1; }
 
     phase="review"
     write_state "$state_dir/current" ||
