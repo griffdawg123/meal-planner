@@ -12,6 +12,8 @@ var ErrNoSuitableMeal = errors.New("no suitable meal")
 // Meal is a candidate dinner described by the preference values it relates to.
 type Meal struct {
 	Title string
+	// Description is a short summary of the meal shown to members alongside its title.
+	Description string
 	// Satisfies lists preference values the meal fulfills, such as a cuisine or "under 30 minutes".
 	Satisfies []string
 	// Conflicts lists preference values the meal violates, such as an allergen it contains, a diet
