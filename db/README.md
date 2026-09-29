@@ -96,5 +96,44 @@ used rows are inert and may be pruned at any time.
 All three tables cascade on member deletion so removed members immediately lose their web
 identities, unused links, and sessions.
 
+Telegram identities are stored in two tables and linked with a one-time code:
+
+1. A member who is already authenticated (for example through a web session) asks for a linking
+   code. The service generates a short random code, stores its SHA-256 hash in
+   `telegram_link_code` against that member, and shows the raw code to the member.
+2. The member sends the code to the bot (for example `/link ABCD-1234`). In one transaction the
+   service consumes the unexpired, unused code by setting `used_at` and inserts a
+   `telegram_identity` row pairing the sender's Telegram user ID with the code's member.
+3. For every later message, the bot looks up the sender's Telegram user ID in
+   `telegram_identity` and joins `member` to obtain the household and member. A user ID with no
+   row is unlinked and must not be allowed to read or change any household's data.
+
+The code is issued to a known member rather than typed into the bot first, so possession of the
+code proves the Telegram account belongs to that member and a Telegram user can never choose the
+household or member they are attributed to.
+
+`telegram_identity` is keyed by `telegram_user_id`, Telegram's stable numeric user ID (the
+message's `from.id`), not a username or chat ID: usernames can change or be absent, and a chat ID
+identifies a conversation (possibly a group) rather than the person who sent a message. The ID must
+be a positive integer; the table is `WITHOUT ROWID` so a `NULL` ID is rejected instead of becoming an
+automatically assigned rowid. The key makes each Telegram account resolve to exactly one member,
+and `member_id` is `UNIQUE`, matching `web_identity`, so a member has at most one linked Telegram
+account. Relinking a member to a different account is a delete followed by an insert. `linked_at`
+records when the link was made, in Unix seconds.
+
+`telegram_link_code` mirrors `magic_link`: only a 32-byte SHA-256 hash of the code is stored, the
+code belongs to exactly one member, all timestamps are integer Unix seconds, `expires_at` is after
+`created_at`, and `used_at` may only be set within `created_at <= used_at < expires_at`. The
+`telegram_link_code_single_use` trigger rejects any change to `used_at` once it is set, so a code
+links at most one Telegram account. Because these are new tables, their rules are `CHECK`
+constraints; only the single-use rule, which compares old and new values, needs a trigger. Codes are
+meant to be short enough to type, so the service must keep their lifetime brief (minutes) and limit
+failed attempts; the hash keeps a leaked database from revealing live codes but cannot make a
+low-entropy code resistant to offline guessing. Expired or used rows are inert and may be pruned at
+any time. The `member_id` index serves pruning and cascading deletes.
+
+Both tables cascade on member deletion (and therefore household deletion), so a removed member's
+Telegram account immediately becomes unlinked and their outstanding codes stop working.
+
 SQLite foreign-key enforcement is connection-local. The schema enables it while applying the DDL;
 every application connection must also execute `PRAGMA foreign_keys = ON`.
