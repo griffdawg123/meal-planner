@@ -890,6 +890,68 @@ func TestApplySchemaAddsTelegramTablesToExistingDatabase(t *testing.T) {
 
 	insertTelegramLinkCode(t, database, tokenHash(1), "member-1", 100, 200)
 	insertTelegramIdentity(t, database, 123456789, "member-1")
+	if err := execTelegramLinkAttempt(database, 123456789, 1, 100); err != nil {
+		t.Fatalf("insert telegram link attempt: %v", err)
+	}
+}
+
+func TestTelegramLinkAttemptSchema(t *testing.T) {
+	t.Run("records failed attempts for a Telegram user who is not linked", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		if err := execTelegramLinkAttempt(database, 123456789, 1, 100); err != nil {
+			t.Fatalf("insert link attempt: got %v, want nil", err)
+		}
+	})
+
+	t.Run("rejects a second record for the same Telegram user", func(t *testing.T) {
+		database := newTestDatabase(t)
+		if err := execTelegramLinkAttempt(database, 123456789, 1, 100); err != nil {
+			t.Fatalf("insert link attempt: %v", err)
+		}
+
+		if err := execTelegramLinkAttempt(database, 123456789, 2, 100); err == nil {
+			t.Fatal("insert duplicate link attempt: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects Telegram user IDs that are not positive integers", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		for _, userID := range []any{nil, 0, -1, 1.5, "alice"} {
+			if err := execTelegramLinkAttempt(database, userID, 1, 100); err == nil {
+				t.Errorf("insert telegram_user_id=%v: got nil error, want error", userID)
+			}
+		}
+	})
+
+	t.Run("rejects failed-attempt counts that are not positive integers", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		for _, count := range []any{nil, 0, -1, 1.5, "many"} {
+			if err := execTelegramLinkAttempt(database, 123456789, count, 100); err == nil {
+				t.Errorf("insert failed_attempts=%v: got nil error, want error", count)
+			}
+		}
+	})
+
+	t.Run("rejects a window start that is not an integer", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		for _, windowStartedAt := range []any{nil, "never", 100.5} {
+			if err := execTelegramLinkAttempt(database, 123456789, 1, windowStartedAt); err == nil {
+				t.Errorf("insert window_started_at=%v: got nil error, want error", windowStartedAt)
+			}
+		}
+	})
+}
+
+func execTelegramLinkAttempt(database *sql.DB, telegramUserID, failedAttempts, windowStartedAt any) error {
+	_, err := database.Exec(
+		`INSERT INTO telegram_link_attempt (telegram_user_id, failed_attempts, window_started_at) VALUES (?, ?, ?)`,
+		telegramUserID, failedAttempts, windowStartedAt,
+	)
+	return err
 }
 
 func insertSecondMember(t *testing.T, database *sql.DB, householdID, memberID string) {

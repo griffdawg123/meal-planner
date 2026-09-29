@@ -16,6 +16,11 @@ const (
 	// to one symbol without bias, and it omits the easily confused I, L, O, and U.
 	telegramLinkCodeAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 	telegramLinkCodeLength   = 8
+
+	// MaxFailedTelegramLinkAttempts is how many invalid link codes one Telegram user may send within
+	// telegramLinkAttemptWindow before further attempts, even with a valid code, are rejected.
+	MaxFailedTelegramLinkAttempts = 5
+	telegramLinkAttemptWindow     = telegramLinkCodeLifetime
 )
 
 var (
@@ -25,6 +30,9 @@ var (
 	ErrTelegramNotLinked = errors.New("telegram user not linked")
 	// ErrTelegramAlreadyLinked identifies a Telegram user that is already linked to another member.
 	ErrTelegramAlreadyLinked = errors.New("telegram user already linked to another member")
+	// ErrTooManyTelegramLinkAttempts identifies a Telegram user that has sent too many invalid link
+	// codes and must wait before trying again.
+	ErrTooManyTelegramLinkAttempts = errors.New("too many telegram link attempts")
 )
 
 // RequestTelegramLinkCode creates a short-lived, single-use code that links a Telegram account to
@@ -58,6 +66,8 @@ func (s *Service) RequestTelegramLinkCode(ctx context.Context, householdID, memb
 
 // LinkTelegram atomically consumes a link code and links telegramUserID to the code's member,
 // replacing any Telegram account previously linked to that member. It returns the linked member.
+// After MaxFailedTelegramLinkAttempts invalid codes within telegramLinkAttemptWindow, it rejects
+// every attempt from telegramUserID with ErrTooManyTelegramLinkAttempts until the window passes.
 func (s *Service) LinkTelegram(ctx context.Context, telegramUserID int64, code string) (Principal, error) {
 	if telegramUserID <= 0 {
 		return Principal{}, fmt.Errorf("%w: telegram user ID must be positive", ErrInvalidInput)
@@ -74,6 +84,26 @@ func (s *Service) LinkTelegram(ctx context.Context, telegramUserID int64, code s
 	}
 	defer tx.Rollback()
 
+	// Count this attempt as a failure before checking the code, starting a new window if the last
+	// one has passed. The count is committed only if the code turns out to be invalid; a lockout
+	// check that rolls back leaves the stored count at its limit.
+	windowCutoff := now.Add(-telegramLinkAttemptWindow).Unix()
+	var failedAttempts int
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO telegram_link_attempt (telegram_user_id, failed_attempts, window_started_at)
+		VALUES (?, 1, ?)
+		ON CONFLICT (telegram_user_id) DO UPDATE SET
+			failed_attempts = CASE WHEN window_started_at <= ? THEN 1 ELSE failed_attempts + 1 END,
+			window_started_at = CASE WHEN window_started_at <= ? THEN excluded.window_started_at ELSE window_started_at END
+		RETURNING failed_attempts
+	`, telegramUserID, now.Unix(), windowCutoff, windowCutoff).Scan(&failedAttempts)
+	if err != nil {
+		return Principal{}, fmt.Errorf("%w: record telegram link attempt: %v", ErrInternal, err)
+	}
+	if failedAttempts > MaxFailedTelegramLinkAttempts {
+		return Principal{}, ErrTooManyTelegramLinkAttempts
+	}
+
 	var memberID string
 	err = tx.QueryRowContext(ctx, `
 		UPDATE telegram_link_code
@@ -82,10 +112,18 @@ func (s *Service) LinkTelegram(ctx context.Context, telegramUserID int64, code s
 		RETURNING member_id
 	`, now.Unix(), hashToken(code), now.Unix()).Scan(&memberID)
 	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return Principal{}, fmt.Errorf("%w: commit failed telegram link attempt: %v", ErrInternal, err)
+		}
 		return Principal{}, ErrInvalidTelegramLinkCode
 	}
 	if err != nil {
 		return Principal{}, fmt.Errorf("%w: consume telegram link code: %v", ErrInternal, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM telegram_link_attempt WHERE telegram_user_id = ?
+	`, telegramUserID); err != nil {
+		return Principal{}, fmt.Errorf("%w: clear telegram link attempts: %v", ErrInternal, err)
 	}
 
 	var linkedMemberID string

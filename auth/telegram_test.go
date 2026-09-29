@@ -193,6 +193,76 @@ func TestTelegramIdentityLinking(t *testing.T) {
 		}
 	})
 
+	t.Run("locks out a Telegram user after too many invalid link codes, even with the right code", func(t *testing.T) {
+		service, database, code := newTelegramCodeService(t)
+
+		guessInvalidTelegramCodes(t, service, 1001, auth.MaxFailedTelegramLinkAttempts)
+
+		if _, err := service.LinkTelegram(context.Background(), 1001, "WRONG-CODE"); !errors.Is(err, auth.ErrTooManyTelegramLinkAttempts) {
+			t.Errorf("excess guess error: got %v, want ErrTooManyTelegramLinkAttempts", err)
+		}
+		if _, err := service.LinkTelegram(context.Background(), 1001, code); !errors.Is(err, auth.ErrTooManyTelegramLinkAttempts) {
+			t.Fatalf("correct code while locked out error: got %v, want ErrTooManyTelegramLinkAttempts", err)
+		}
+		if _, err := service.ResolveTelegram(context.Background(), 1001); !errors.Is(err, auth.ErrTelegramNotLinked) {
+			t.Errorf("resolve locked-out Telegram user error: got %v, want ErrTelegramNotLinked", err)
+		}
+		var usedAt sql.NullInt64
+		if err := database.QueryRow(`SELECT used_at FROM telegram_link_code`).Scan(&usedAt); err != nil {
+			t.Fatalf("read link code: %v", err)
+		}
+		if usedAt.Valid {
+			t.Errorf("link code used_at while locked out: got %d, want NULL", usedAt.Int64)
+		}
+	})
+
+	t.Run("persists the lockout across service instances", func(t *testing.T) {
+		service, database, code := newTelegramCodeService(t)
+
+		guessInvalidTelegramCodes(t, service, 1001, auth.MaxFailedTelegramLinkAttempts)
+
+		restarted := auth.NewService(database)
+		if _, err := restarted.LinkTelegram(context.Background(), 1001, code); !errors.Is(err, auth.ErrTooManyTelegramLinkAttempts) {
+			t.Fatalf("link after restart error: got %v, want ErrTooManyTelegramLinkAttempts", err)
+		}
+	})
+
+	t.Run("counts invalid link codes separately for each Telegram user", func(t *testing.T) {
+		service, _, code := newTelegramCodeService(t)
+
+		guessInvalidTelegramCodes(t, service, 1001, auth.MaxFailedTelegramLinkAttempts)
+
+		if _, err := service.LinkTelegram(context.Background(), 1002, code); err != nil {
+			t.Fatalf("link another Telegram user: %v", err)
+		}
+	})
+
+	t.Run("allows linking again once the failed-attempt window has passed", func(t *testing.T) {
+		service, database, code := newTelegramCodeService(t)
+
+		guessInvalidTelegramCodes(t, service, 1001, auth.MaxFailedTelegramLinkAttempts)
+		if _, err := database.Exec(`UPDATE telegram_link_attempt SET window_started_at = unixepoch() - 3600`); err != nil {
+			t.Fatalf("age failed attempts: %v", err)
+		}
+
+		if _, err := service.LinkTelegram(context.Background(), 1001, code); err != nil {
+			t.Fatalf("link after window: %v", err)
+		}
+	})
+
+	t.Run("clears failed attempts after a successful link", func(t *testing.T) {
+		service, database, code := newTelegramCodeService(t)
+
+		guessInvalidTelegramCodes(t, service, 1001, auth.MaxFailedTelegramLinkAttempts-1)
+		if _, err := service.LinkTelegram(context.Background(), 1001, code); err != nil {
+			t.Fatalf("link with remaining attempt: %v", err)
+		}
+
+		if got := countRows(t, database, "telegram_link_attempt"); got != 0 {
+			t.Errorf("failed-attempt records after link: got %d, want 0", got)
+		}
+	})
+
 	t.Run("rejects requesting a link code for a member outside the household", func(t *testing.T) {
 		database := newTestDatabase(t)
 		insertHousehold(t, database, "household-1", "member-1")
@@ -308,4 +378,14 @@ func newTelegramCodeService(t *testing.T) (*auth.Service, *sql.DB, string) {
 		t.Fatalf("request link code: %v", err)
 	}
 	return service, database, code
+}
+
+func guessInvalidTelegramCodes(t *testing.T, service *auth.Service, telegramUserID int64, count int) {
+	t.Helper()
+
+	for i := 0; i < count; i++ {
+		if _, err := service.LinkTelegram(context.Background(), telegramUserID, "WRONG-CODE"); !errors.Is(err, auth.ErrInvalidTelegramLinkCode) {
+			t.Fatalf("invalid guess %d error: got %v, want ErrInvalidTelegramLinkCode", i+1, err)
+		}
+	}
 }
