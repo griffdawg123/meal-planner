@@ -52,4 +52,9 @@ go run ./cmd/meal-planner -db /path/to/meal-planner.db
    These confirm the connection works end to end. If Telegram rate limits a reply, the bot waits
    as long as Telegram asks and resends it, up to three times.
 
+Connection problems are written to the application log, never including the token. If Telegram
+rejects the token at startup, the application exits saying so. A failed poll is logged and retried
+every five seconds, and once polling works again the application logs how many polls failed. A
+message the bot could not handle or reply to is logged with its update ID and skipped.
+
 Without a token, the application initializes the database and exits without starting the bot.
