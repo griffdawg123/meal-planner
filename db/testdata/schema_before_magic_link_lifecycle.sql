@@ -112,8 +112,8 @@ CREATE TABLE IF NOT EXISTS web_identity (
 );
 
 CREATE TABLE IF NOT EXISTS magic_link (
-    token_hash BLOB NOT NULL PRIMARY KEY
-                    CHECK (typeof(token_hash) = 'blob' AND length(token_hash) = 32),
+    token_hash BLOB PRIMARY KEY
+                    CHECK (length(token_hash) = 32),
     member_id  TEXT NOT NULL
                     CHECK (member_id <> ''),
     created_at INTEGER NOT NULL,
@@ -125,65 +125,6 @@ CREATE TABLE IF NOT EXISTS magic_link (
         REFERENCES member (id)
         ON DELETE CASCADE
 );
-
--- Lifecycle rules live in triggers rather than CHECK constraints because
--- CREATE TABLE IF NOT EXISTS cannot add constraints to an existing table,
--- whereas these triggers are installed on existing databases as well.
-CREATE TRIGGER IF NOT EXISTS magic_link_valid_insert
-BEFORE INSERT ON magic_link
-WHEN typeof(NEW.token_hash) <> 'blob'
-    OR length(NEW.token_hash) <> 32
-    OR typeof(NEW.created_at) <> 'integer'
-    OR typeof(NEW.expires_at) <> 'integer'
-    OR NEW.expires_at <= NEW.created_at
-    OR (NEW.used_at IS NOT NULL AND (
-        typeof(NEW.used_at) <> 'integer'
-        OR NEW.used_at < NEW.created_at
-        OR NEW.used_at >= NEW.expires_at
-    ))
-BEGIN
-    SELECT RAISE(ABORT, 'invalid magic link lifecycle');
-END;
-
-CREATE TRIGGER IF NOT EXISTS magic_link_valid_update
-BEFORE UPDATE ON magic_link
-WHEN typeof(NEW.token_hash) <> 'blob'
-    OR length(NEW.token_hash) <> 32
-    OR typeof(NEW.created_at) <> 'integer'
-    OR typeof(NEW.expires_at) <> 'integer'
-    OR NEW.expires_at <= NEW.created_at
-    OR (NEW.used_at IS NOT NULL AND (
-        typeof(NEW.used_at) <> 'integer'
-        OR NEW.used_at < NEW.created_at
-        OR NEW.used_at >= NEW.expires_at
-    ))
-BEGIN
-    SELECT RAISE(ABORT, 'invalid magic link lifecycle');
-END;
-
-CREATE TRIGGER IF NOT EXISTS magic_link_single_use
-BEFORE UPDATE OF used_at ON magic_link
-WHEN OLD.used_at IS NOT NULL
-BEGIN
-    SELECT RAISE(ABORT, 'magic link has already been used');
-END;
-
--- The triggers only guard future writes. Rows written before they existed
--- may break the same rules, and consuming one would then abort inside the
--- update trigger. Links are short-lived and reissued on request, so discard
--- any such row rather than repair it. After the first upgrade this matches
--- nothing, keeping the schema safe to reapply.
-DELETE FROM magic_link
-WHERE typeof(token_hash) <> 'blob'
-    OR length(token_hash) <> 32
-    OR typeof(created_at) <> 'integer'
-    OR typeof(expires_at) <> 'integer'
-    OR expires_at <= created_at
-    OR (used_at IS NOT NULL AND (
-        typeof(used_at) <> 'integer'
-        OR used_at < created_at
-        OR used_at >= expires_at
-    ));
 
 CREATE TABLE IF NOT EXISTS web_session (
     token_hash BLOB PRIMARY KEY

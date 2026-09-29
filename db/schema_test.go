@@ -1,8 +1,12 @@
 package db_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"os"
+	"strings"
 	"testing"
 
 	mealdb "github.com/griffdawg123/meal-planner/db"
@@ -87,6 +91,438 @@ func TestPreferenceSchema(t *testing.T) {
 	`, "preference-wrong-household", "household-1", "member-2", "soft", "dislike", "mushrooms", 3); err == nil {
 		t.Fatal("insert accepted a preference for a member belonging to another household")
 	}
+}
+
+func TestMagicLinkSchema(t *testing.T) {
+	t.Run("stores an unused link for a member", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+	})
+
+	t.Run("rejects a link for an unknown member", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		if err := execMagicLink(database, tokenHash(1), "missing-member", 100, 200); err == nil {
+			t.Fatal("insert accepted a magic link for an unknown member: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects a token hash that is not a SHA-256 digest", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		if err := execMagicLink(database, []byte("raw-token"), "member-1", 100, 200); err == nil {
+			t.Fatal("insert accepted a non-digest token hash: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects a token hash that is null or not a blob", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		assertTokenHashRequired(t, database)
+	})
+
+	t.Run("rejects a link that expires before it is created", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		if err := execMagicLink(database, tokenHash(1), "member-1", 200, 200); err == nil {
+			t.Fatal("insert accepted expires_at equal to created_at: got nil error, want error")
+		}
+	})
+
+	t.Run("allows consuming a link within its lifetime", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+		if _, err := database.Exec(`UPDATE magic_link SET used_at = 150`); err != nil {
+			t.Fatalf("consume magic link: got %v, want nil", err)
+		}
+	})
+
+	t.Run("rejects consuming a link at or after its expiry", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+		for _, usedAt := range []int64{200, 201} {
+			if _, err := database.Exec(`UPDATE magic_link SET used_at = ?`, usedAt); err == nil {
+				t.Errorf("consume at %d: got nil error, want error", usedAt)
+			}
+		}
+	})
+
+	t.Run("rejects consuming a link before it was created", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+		if _, err := database.Exec(`UPDATE magic_link SET used_at = 99`); err == nil {
+			t.Fatal("consume before creation: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects clearing or changing the use of a consumed link", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+		if _, err := database.Exec(`UPDATE magic_link SET used_at = 150`); err != nil {
+			t.Fatalf("consume magic link: %v", err)
+		}
+
+		for _, statement := range []string{
+			`UPDATE magic_link SET used_at = NULL`,
+			`UPDATE magic_link SET used_at = 160`,
+		} {
+			if _, err := database.Exec(statement); err == nil {
+				t.Errorf("%s: got nil error, want error", statement)
+			}
+		}
+
+		var usedAt int64
+		if err := database.QueryRow(`SELECT used_at FROM magic_link`).Scan(&usedAt); err != nil {
+			t.Fatalf("read used_at: %v", err)
+		}
+		if usedAt != 150 {
+			t.Errorf("used_at after rejected updates: got %d, want 150", usedAt)
+		}
+	})
+
+	t.Run("rejects timestamps that are not integers", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		for _, values := range [][2]any{
+			{"never", 200},
+			{100, "never"},
+			{100, 200.5},
+		} {
+			if _, err := database.Exec(
+				`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+				tokenHash(1), "member-1", values[0], values[1],
+			); err == nil {
+				t.Errorf("insert created_at=%v expires_at=%v: got nil error, want error", values[0], values[1])
+			}
+		}
+
+		insertMagicLink(t, database, tokenHash(2), "member-1", 100, 200)
+		for _, statement := range []string{
+			`UPDATE magic_link SET expires_at = 'never'`,
+			`UPDATE magic_link SET used_at = 'never'`,
+			`UPDATE magic_link SET used_at = 150.5`,
+		} {
+			if _, err := database.Exec(statement); err == nil {
+				t.Errorf("%s: got nil error, want error", statement)
+			}
+		}
+	})
+
+	t.Run("deleting a member cascades to its magic links", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		if _, err := database.Exec(
+			`INSERT INTO member (id, household_id, name) VALUES (?, ?, ?)`,
+			"member-2", "household-1", "Second Member",
+		); err != nil {
+			t.Fatalf("insert second member: %v", err)
+		}
+		insertMagicLink(t, database, tokenHash(1), "member-2", 100, 200)
+
+		if _, err := database.Exec(`DELETE FROM member WHERE id = ?`, "member-2"); err != nil {
+			t.Fatalf("delete member: %v", err)
+		}
+
+		var links int
+		if err := database.QueryRow(`SELECT count(*) FROM magic_link`).Scan(&links); err != nil {
+			t.Fatalf("count magic links: %v", err)
+		}
+		if links != 0 {
+			t.Errorf("magic links remaining after member deletion: got %d, want 0", links)
+		}
+	})
+}
+
+func TestApplySchemaCanBeReapplied(t *testing.T) {
+	database := newTestDatabase(t)
+	insertHousehold(t, database, "household-1", "member-1")
+
+	var householdCreatedAt, memberCreatedAt string
+	if err := database.QueryRow(
+		`SELECT created_at FROM household WHERE id = ?`, "household-1",
+	).Scan(&householdCreatedAt); err != nil {
+		t.Fatalf("read household creation time: %v", err)
+	}
+	if err := database.QueryRow(
+		`SELECT created_at FROM member WHERE id = ?`, "member-1",
+	).Scan(&memberCreatedAt); err != nil {
+		t.Fatalf("read member creation time: %v", err)
+	}
+
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("reapply schema: %v", err)
+	}
+
+	var householdID, householdName, timezone, creatorID, gotHouseholdCreatedAt string
+	if err := database.QueryRow(
+		`SELECT id, name, timezone, created_by_member_id, created_at FROM household WHERE id = ?`,
+		"household-1",
+	).Scan(&householdID, &householdName, &timezone, &creatorID, &gotHouseholdCreatedAt); err != nil {
+		t.Fatalf("read household after schema reapplication: %v", err)
+	}
+	if householdID != "household-1" || householdName != "Test Household" || timezone != "Australia/Sydney" || creatorID != "member-1" || gotHouseholdCreatedAt != householdCreatedAt {
+		t.Fatalf(
+			"household changed after schema reapplication: got (%q, %q, %q, %q, %q), want (%q, %q, %q, %q, %q)",
+			householdID, householdName, timezone, creatorID, gotHouseholdCreatedAt,
+			"household-1", "Test Household", "Australia/Sydney", "member-1", householdCreatedAt,
+		)
+	}
+
+	var memberID, memberHouseholdID, memberName, gotMemberCreatedAt string
+	if err := database.QueryRow(
+		`SELECT id, household_id, name, created_at FROM member WHERE id = ?`,
+		"member-1",
+	).Scan(&memberID, &memberHouseholdID, &memberName, &gotMemberCreatedAt); err != nil {
+		t.Fatalf("read member after schema reapplication: %v", err)
+	}
+	if memberID != "member-1" || memberHouseholdID != "household-1" || memberName != "Test Member" || gotMemberCreatedAt != memberCreatedAt {
+		t.Fatalf(
+			"member changed after schema reapplication: got (%q, %q, %q, %q), want (%q, %q, %q, %q)",
+			memberID, memberHouseholdID, memberName, gotMemberCreatedAt,
+			"member-1", "household-1", "Test Member", memberCreatedAt,
+		)
+	}
+}
+
+func TestApplySchemaUpgradesMagicLinkLifecycle(t *testing.T) {
+	// The fixture is the schema as released before the magic-link lifecycle
+	// rules, so existing databases must gain them when the schema is reapplied.
+	legacySchema, err := os.ReadFile("testdata/schema_before_magic_link_lifecycle.sql")
+	if err != nil {
+		t.Fatalf("read legacy schema: %v", err)
+	}
+	database := openTestDatabase(t)
+	if _, err := database.Exec(string(legacySchema)); err != nil {
+		t.Fatalf("apply legacy schema: %v", err)
+	}
+	insertHousehold(t, database, "household-1", "member-1")
+	insertMagicLink(t, database, tokenHash(1), "member-1", 100, 200)
+
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("upgrade schema: %v", err)
+	}
+
+	for _, statement := range []string{
+		`UPDATE magic_link SET used_at = 201`,
+		`UPDATE magic_link SET used_at = 99`,
+		`UPDATE magic_link SET expires_at = 'never'`,
+	} {
+		if _, err := database.Exec(statement); err == nil {
+			t.Errorf("%s: got nil error, want error", statement)
+		}
+	}
+	if err := execMagicLink(database, tokenHash(2), "member-1", 100, 200); err != nil {
+		t.Fatalf("insert magic link after upgrade: got %v, want nil", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		tokenHash(3), "member-1", 100, "never",
+	); err == nil {
+		t.Error("insert non-expiring magic link after upgrade: got nil error, want error")
+	}
+	assertTokenHashRequired(t, database)
+
+	if _, err := database.Exec(`UPDATE magic_link SET used_at = 150 WHERE token_hash = ?`, tokenHash(1)); err != nil {
+		t.Fatalf("consume magic link after upgrade: got %v, want nil", err)
+	}
+	if _, err := database.Exec(`UPDATE magic_link SET used_at = NULL WHERE token_hash = ?`, tokenHash(1)); err == nil {
+		t.Error("reset consumed magic link after upgrade: got nil error, want error")
+	}
+}
+
+func TestApplySchemaDiscardsInvalidLegacyMagicLinks(t *testing.T) {
+	legacySchema, err := os.ReadFile("testdata/schema_before_magic_link_lifecycle.sql")
+	if err != nil {
+		t.Fatalf("read legacy schema: %v", err)
+	}
+	database := openTestDatabase(t)
+	if _, err := database.Exec(string(legacySchema)); err != nil {
+		t.Fatalf("apply legacy schema: %v", err)
+	}
+	insertHousehold(t, database, "household-1", "member-1")
+
+	// Every row below was accepted by the legacy schema's constraints.
+	legacyRows := []struct {
+		name      string
+		hash      any
+		createdAt any
+		expiresAt any
+		usedAt    any
+	}{
+		{"valid unused link", tokenHash(1), 100, 200, nil},
+		{"valid consumed link", tokenHash(2), 100, 200, 150},
+		{"non-expiring link", tokenHash(3), 100, "never", nil},
+		{"fractional created_at", tokenHash(4), 100.5, 200, nil},
+		{"null token hash", nil, 100, 200, nil},
+		{"text token hash", strings.Repeat("x", 32), 100, 200, nil},
+		{"consumed at expiry", tokenHash(5), 100, 200, 200},
+		{"consumed before creation", tokenHash(6), 100, 200, 99},
+		{"text used_at", tokenHash(7), 100, 200, "soon"},
+	}
+	for _, row := range legacyRows {
+		if _, err := database.Exec(
+			`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?)`,
+			row.hash, "member-1", row.createdAt, row.expiresAt, row.usedAt,
+		); err != nil {
+			t.Fatalf("insert legacy %s: %v", row.name, err)
+		}
+	}
+
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("upgrade schema: %v", err)
+	}
+
+	rows, err := database.Query(`SELECT token_hash FROM magic_link ORDER BY created_at, used_at`)
+	if err != nil {
+		t.Fatalf("query magic links: %v", err)
+	}
+	defer rows.Close()
+
+	var remaining [][]byte
+	for rows.Next() {
+		var hash []byte
+		if err := rows.Scan(&hash); err != nil {
+			t.Fatalf("scan magic link: %v", err)
+		}
+		remaining = append(remaining, hash)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate magic links: %v", err)
+	}
+
+	want := [][]byte{tokenHash(1), tokenHash(2)}
+	if len(remaining) != len(want) || !bytes.Equal(remaining[0], want[0]) || !bytes.Equal(remaining[1], want[1]) {
+		t.Fatalf("magic links after upgrade: got %x, want %x", remaining, want)
+	}
+}
+
+func newTestDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+
+	database := openTestDatabase(t)
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+
+	return database
+}
+
+func openTestDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	database.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+
+	return database
+}
+
+func insertHousehold(t *testing.T, database *sql.DB, householdID, memberID string) {
+	t.Helper()
+
+	tx, err := database.Begin()
+	if err != nil {
+		t.Fatalf("begin household creation: %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`INSERT INTO household (id, name, timezone, created_by_member_id) VALUES (?, ?, ?, ?)`,
+		householdID, "Test Household", "Australia/Sydney", memberID,
+	); err != nil {
+		t.Fatalf("insert household: %v", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO member (id, household_id, name) VALUES (?, ?, ?)`,
+		memberID, householdID, "Test Member",
+	); err != nil {
+		t.Fatalf("insert first member: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit household creation: %v", err)
+	}
+}
+
+func insertMagicLink(t *testing.T, database *sql.DB, hash []byte, memberID string, createdAt, expiresAt int64) {
+	t.Helper()
+
+	if err := execMagicLink(database, hash, memberID, createdAt, expiresAt); err != nil {
+		t.Fatalf("insert magic link: %v", err)
+	}
+}
+
+func execMagicLink(database *sql.DB, hash []byte, memberID string, createdAt, expiresAt int64) error {
+	return execMagicLinkValue(database, hash, memberID, createdAt, expiresAt)
+}
+
+func execMagicLinkValue(database *sql.DB, hash any, memberID string, createdAt, expiresAt int64) error {
+	_, err := database.Exec(
+		`INSERT INTO magic_link (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		hash, memberID, createdAt, expiresAt,
+	)
+	return err
+}
+
+// assertTokenHashRequired checks that magic links cannot be stored or updated
+// with a token hash that is NULL or a 32-character string rather than a
+// 32-byte digest. The database must contain member-1.
+func assertTokenHashRequired(t *testing.T, database *sql.DB) {
+	t.Helper()
+
+	textHash := strings.Repeat("a", 32)
+	for _, hash := range []any{nil, textHash} {
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := execMagicLinkValue(database, hash, "member-1", 100, 200); err == nil {
+				t.Errorf("insert token_hash=%v (attempt %d): got nil error, want error", hash, attempt+1)
+			}
+		}
+	}
+
+	valid := tokenHash(99)
+	insertMagicLink(t, database, valid, "member-1", 100, 200)
+	for _, hash := range []any{nil, textHash} {
+		if _, err := database.Exec(
+			`UPDATE magic_link SET token_hash = ? WHERE token_hash = ?`, hash, valid,
+		); err == nil {
+			t.Errorf("update token_hash to %v: got nil error, want error", hash)
+		}
+	}
+
+	var invalid int
+	if err := database.QueryRow(
+		`SELECT count(*) FROM magic_link WHERE typeof(token_hash) <> 'blob' OR length(token_hash) <> 32`,
+	).Scan(&invalid); err != nil {
+		t.Fatalf("count invalid token hashes: %v", err)
+	}
+	if invalid != 0 {
+		t.Errorf("magic links with invalid token hashes: got %d, want 0", invalid)
+	}
+}
+
+// tokenHash returns a distinct 32-byte value shaped like a SHA-256 digest.
+func tokenHash(seed byte) []byte {
+	hash := sha256.Sum256([]byte{seed})
+	return hash[:]
 }
 
 func TestAwayNightSchema(t *testing.T) {
@@ -202,104 +638,6 @@ func TestAwayNightSchema(t *testing.T) {
 			t.Fatalf("away nights remaining after household deletion: got %d, want 0", awayNights)
 		}
 	})
-}
-
-func TestApplySchemaCanBeReapplied(t *testing.T) {
-	database := newTestDatabase(t)
-	insertHousehold(t, database, "household-1", "member-1")
-
-	var householdCreatedAt, memberCreatedAt string
-	if err := database.QueryRow(
-		`SELECT created_at FROM household WHERE id = ?`, "household-1",
-	).Scan(&householdCreatedAt); err != nil {
-		t.Fatalf("read household creation time: %v", err)
-	}
-	if err := database.QueryRow(
-		`SELECT created_at FROM member WHERE id = ?`, "member-1",
-	).Scan(&memberCreatedAt); err != nil {
-		t.Fatalf("read member creation time: %v", err)
-	}
-
-	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
-		t.Fatalf("reapply schema: %v", err)
-	}
-
-	var householdID, householdName, timezone, creatorID, gotHouseholdCreatedAt string
-	if err := database.QueryRow(
-		`SELECT id, name, timezone, created_by_member_id, created_at FROM household WHERE id = ?`,
-		"household-1",
-	).Scan(&householdID, &householdName, &timezone, &creatorID, &gotHouseholdCreatedAt); err != nil {
-		t.Fatalf("read household after schema reapplication: %v", err)
-	}
-	if householdID != "household-1" || householdName != "Test Household" || timezone != "Australia/Sydney" || creatorID != "member-1" || gotHouseholdCreatedAt != householdCreatedAt {
-		t.Fatalf(
-			"household changed after schema reapplication: got (%q, %q, %q, %q, %q), want (%q, %q, %q, %q, %q)",
-			householdID, householdName, timezone, creatorID, gotHouseholdCreatedAt,
-			"household-1", "Test Household", "Australia/Sydney", "member-1", householdCreatedAt,
-		)
-	}
-
-	var memberID, memberHouseholdID, memberName, gotMemberCreatedAt string
-	if err := database.QueryRow(
-		`SELECT id, household_id, name, created_at FROM member WHERE id = ?`,
-		"member-1",
-	).Scan(&memberID, &memberHouseholdID, &memberName, &gotMemberCreatedAt); err != nil {
-		t.Fatalf("read member after schema reapplication: %v", err)
-	}
-	if memberID != "member-1" || memberHouseholdID != "household-1" || memberName != "Test Member" || gotMemberCreatedAt != memberCreatedAt {
-		t.Fatalf(
-			"member changed after schema reapplication: got (%q, %q, %q, %q), want (%q, %q, %q, %q)",
-			memberID, memberHouseholdID, memberName, gotMemberCreatedAt,
-			"member-1", "household-1", "Test Member", memberCreatedAt,
-		)
-	}
-}
-
-func newTestDatabase(t *testing.T) *sql.DB {
-	t.Helper()
-
-	database, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("open database: %v", err)
-	}
-	database.SetMaxOpenConns(1)
-	t.Cleanup(func() {
-		if err := database.Close(); err != nil {
-			t.Errorf("close database: %v", err)
-		}
-	})
-
-	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
-		t.Fatalf("apply schema: %v", err)
-	}
-
-	return database
-}
-
-func insertHousehold(t *testing.T, database *sql.DB, householdID, memberID string) {
-	t.Helper()
-
-	tx, err := database.Begin()
-	if err != nil {
-		t.Fatalf("begin household creation: %v", err)
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(
-		`INSERT INTO household (id, name, timezone, created_by_member_id) VALUES (?, ?, ?, ?)`,
-		householdID, "Test Household", "Australia/Sydney", memberID,
-	); err != nil {
-		t.Fatalf("insert household: %v", err)
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO member (id, household_id, name) VALUES (?, ?, ?)`,
-		memberID, householdID, "Test Member",
-	); err != nil {
-		t.Fatalf("insert first member: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit household creation: %v", err)
-	}
 }
 
 func insertAwayNight(t *testing.T, database *sql.DB, householdID, memberID, night string) {
