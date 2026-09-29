@@ -8,6 +8,7 @@ readonly LABEL_NEEDS_ATTENTION="devloop:needs-attention"
 readonly LABEL_NO_CHANGES_NEEDED="devloop:no-changes-needed"
 readonly PAUSE_EXIT_CODE=75
 readonly PR_CREATE_ATTEMPTS=3
+readonly PR_HEAD_ATTEMPTS=8
 
 usage() {
   cat <<'EOF'
@@ -287,6 +288,27 @@ open_pr() {
   return 1
 }
 
+# Waits until GitHub reports expected_head as the PR's head commit. Reviewer backends read the PR
+# from GitHub (gh pr diff, ultrareview), and GitHub can take a moment to update a PR after a
+# push; reviewing before then re-reviews the previous commit. That happened on #296: the last fix
+# round's review repeated the previous finding word for word, against code the round had already
+# changed, and used up the final round on nothing.
+wait_for_pr_head() {
+  local pr_number="$1" expected_head="$2" attempt head
+  local delay="${DEVLOOP_RETRY_DELAY_SECONDS:-15}"
+
+  for ((attempt = 1; attempt <= PR_HEAD_ATTEMPTS; attempt++)); do
+    head="$(gh pr view "$pr_number" --json headRefOid -q .headRefOid 2>/dev/null || true)"
+    [[ "$head" != "$expected_head" ]] || return 0
+    if (( attempt < PR_HEAD_ATTEMPTS )); then
+      printf 'PR #%s head is %s on GitHub, waiting for pushed commit %s (attempt %s of %s)\n' \
+        "$pr_number" "${head:0:7}" "${expected_head:0:7}" "$attempt" "$PR_HEAD_ATTEMPTS" >&2
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
 # Rewrites the whole resume-state file from run_one_cycle's locals (bash's dynamic scoping
 # makes them visible here). Written to a temp file and renamed so an interruption never
 # leaves a half-written state file for the next run to source.
@@ -373,7 +395,7 @@ EOF
 run_one_cycle() {
   local state_dir issue_number title body parent_number parent_body phase
   local worktree branch prompt_file implementer reviewer pr_number fix_round
-  local test_cmd root max_rounds feedback_file fix_prompt_file rc
+  local test_cmd root max_rounds feedback_file fix_prompt_file rc pushed_head
 
   root="$(repository_root)"
   state_dir="$(state_directory)"
@@ -482,6 +504,10 @@ Closes #$issue_number") || { mark_needs_attention "$issue_number" "git commit fa
   while true; do
     case "$phase" in
       review)
+        pushed_head="$(cd "$worktree" && git rev-parse HEAD)" ||
+          { mark_needs_attention "$issue_number" "could not read the worktree HEAD before reviewing PR #$pr_number"; rm -f "$state_dir/current"; return 1; }
+        wait_for_pr_head "$pr_number" "$pushed_head" ||
+          { mark_needs_attention "$issue_number" "PR #$pr_number never showed pushed commit ${pushed_head:0:7} on GitHub, so it was not reviewed"; rm -f "$state_dir/current"; return 1; }
         printf 'reviewing PR #%s via %s\n' "$pr_number" "$reviewer"
         feedback_file="$state_dir/review-$issue_number-round-$fix_round.md"
         # A leftover file from an interrupted earlier attempt must not be mistaken for

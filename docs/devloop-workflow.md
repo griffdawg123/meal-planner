@@ -68,7 +68,12 @@ dev/devloop run --once    # do a single issue and stop
    GitHub's API gives occasional transient 5xx errors. Each attempt first
    looks for an open PR for the branch, so a create that reported an error
    but actually went through is picked up rather than duplicated.
-7. Dispatches the reviewer backend against the PR. If it requests changes,
+7. Waits until GitHub shows the commit just pushed as the PR's head
+   (polling up to 8 times, 15s apart). Reviewers read the PR from GitHub,
+   which can briefly lag a push, and reviewing too early re-reviews the
+   previous commit. If it never catches up, the loop stops with
+   needs-attention instead of reviewing stale code. Then dispatches the
+   reviewer backend against the PR. If it requests changes,
    runs a **fix round** (see below) and reviews again, up to
    `devloop.maxFixRounds` times (default 2). Still requesting changes after
    that — or a reviewer that fails without leaving any findings — does the
