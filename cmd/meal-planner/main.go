@@ -54,11 +54,14 @@ func runBot(ctx context.Context, token string) error {
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
+	if err := client.DeleteWebhook(ctx); err != nil {
+		return fmt.Errorf("switch to long polling: %w", err)
+	}
 	log.Printf("telegram bot connected: @%s; send it /ping to check the connection", bot.Username)
 
 	poller := &telegram.Poller{
 		Updates:    client,
-		Handler:    telegram.NewHealthCheck(client),
+		Handler:    telegram.NewHealthCheck(client, bot.Username),
 		Timeout:    pollTimeout,
 		RetryDelay: 5 * time.Second,
 	}

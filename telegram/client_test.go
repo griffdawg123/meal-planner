@@ -99,6 +99,23 @@ func TestClient(t *testing.T) {
 		}
 	})
 
+	t.Run("deletes any webhook so updates can be long polled, keeping pending updates", func(t *testing.T) {
+		api := newFakeBotAPI(t, `{"ok":true,"result":true}`)
+		client := telegram.NewClient(api.server.URL, testToken, api.server.Client())
+
+		if err := client.DeleteWebhook(context.Background()); err != nil {
+			t.Fatalf("delete webhook: got %v, want nil", err)
+		}
+
+		if api.path != "/bot"+testToken+"/deleteWebhook" {
+			t.Errorf("request path: got %q, want %q", api.path, "/bot"+testToken+"/deleteWebhook")
+		}
+		want := map[string]any{"drop_pending_updates": false}
+		if !reflect.DeepEqual(api.body, want) {
+			t.Errorf("request body: got %v, want %v", api.body, want)
+		}
+	})
+
 	t.Run("reports an error Telegram returns as an APIError", func(t *testing.T) {
 		api := newFakeBotAPI(t, `{"ok":false,"error_code":403,"description":"Forbidden: bot was blocked by the user"}`)
 		client := telegram.NewClient(api.server.URL, testToken, api.server.Client())

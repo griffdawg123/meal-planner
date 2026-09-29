@@ -100,6 +100,32 @@ func TestPoller(t *testing.T) {
 			t.Errorf("reported errors: got %v, want [%v]", reported, pollErr)
 		}
 	})
+
+	t.Run("stops with the conflict when Telegram refuses to long poll", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		conflict := &telegram.APIError{Method: "getUpdates", Code: 409, Description: "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first"}
+		source := &scriptedUpdates{
+			batches:  [][]telegram.Update{nil, nil},
+			failures: map[int]error{0: conflict, 1: conflict},
+			whenDone: cancel,
+		}
+		poller := &telegram.Poller{
+			Updates:    source,
+			Handler:    telegram.HandlerFunc(func(context.Context, telegram.Update) error { return nil }),
+			RetryDelay: time.Millisecond,
+			OnError:    func(error) {},
+		}
+
+		err := poller.Run(ctx)
+
+		if !errors.Is(err, telegram.ErrPollingConflict) || !errors.Is(err, conflict) {
+			t.Fatalf("run: got %v, want it to wrap %v and %v", err, telegram.ErrPollingConflict, conflict)
+		}
+		if len(source.offsets) != 1 {
+			t.Errorf("polls: got %d, want 1", len(source.offsets))
+		}
+	})
 }
 
 // scriptedUpdates returns batches in order, failing the poll whose index is in failures, and calls

@@ -2,10 +2,17 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 )
+
+// ErrPollingConflict identifies a poll Telegram refused because a webhook is set for the bot or
+// another process is already long polling with the same token. Retrying cannot succeed until that
+// is resolved.
+var ErrPollingConflict = errors.New("telegram refused long polling: delete the bot's webhook and stop any other process polling with the same token")
 
 // Updates fetches incoming Bot API updates by long polling. Client implements it.
 type Updates interface {
@@ -41,12 +48,17 @@ type Poller struct {
 
 // Run polls until ctx is done, then returns ctx's error. A failed update is reported and skipped,
 // so one bad message cannot stall the bot; a failed poll is reported and retried after RetryDelay.
+// A poll refused with a conflict is not retried: Run returns it, wrapped in ErrPollingConflict.
 func (p *Poller) Run(ctx context.Context) error {
 	var offset int64
 	for {
 		updates, err := p.Updates.GetUpdates(ctx, offset, p.Timeout)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == http.StatusConflict {
+			return fmt.Errorf("%w: %w", ErrPollingConflict, err)
 		}
 		if err != nil {
 			p.report(fmt.Errorf("poll telegram updates: %w", err))

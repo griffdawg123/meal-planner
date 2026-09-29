@@ -45,8 +45,9 @@ go run ./cmd/meal-planner -db /path/to/meal-planner.db
    TELEGRAM_BOT_TOKEN_FILE=/run/secrets/telegram-bot-token go run ./cmd/meal-planner
    ```
 
-   Long polling does not work while a webhook is set for the bot; remove one with the Bot API's
-   `deleteWebhook` method.
+   Long polling does not work while a webhook is set for the bot, so the application deletes any
+   webhook when it starts. Only one process may poll with a token at a time; if Telegram reports
+   a conflict, the application exits with an explanation instead of retrying.
 4. Message the bot `/ping` and it replies `pong`; `/echo some text` replies with the same text.
    These confirm the connection works end to end.
 

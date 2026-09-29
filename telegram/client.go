@@ -87,6 +87,15 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 	return updates, err
 }
 
+// DeleteWebhook removes the bot's webhook, if any, so its updates can be long polled. Updates
+// already waiting for delivery are kept.
+func (c *Client) DeleteWebhook(ctx context.Context) error {
+	params := struct {
+		DropPendingUpdates bool `json:"drop_pending_updates"`
+	}{false}
+	return c.call(ctx, "deleteWebhook", params, nil)
+}
+
 // SendMessage sends text to chatID, formatted according to parseMode unless it is empty.
 func (c *Client) SendMessage(ctx context.Context, chatID int64, text, parseMode string) error {
 	params := struct {

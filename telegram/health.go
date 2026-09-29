@@ -9,14 +9,17 @@ import (
 const echoUsage = "Send /echo followed by some text and I'll send it back."
 
 // HealthCheck answers the /ping and /echo commands, confirming end to end that the bot receives
-// messages and can reply to them. It ignores every other update.
+// messages and can reply to them. It ignores every other update, including commands addressed to
+// other bots.
 type HealthCheck struct {
-	sender Sender
+	sender   Sender
+	username string
 }
 
-// NewHealthCheck returns a health check that replies through sender.
-func NewHealthCheck(sender Sender) *HealthCheck {
-	return &HealthCheck{sender: sender}
+// NewHealthCheck returns a health check for the bot named username, as reported by GetMe, that
+// replies through sender.
+func NewHealthCheck(sender Sender, username string) *HealthCheck {
+	return &HealthCheck{sender: sender, username: username}
 }
 
 // HandleUpdate replies "pong" to /ping and repeats the text after /echo, in the same chat.
@@ -24,7 +27,10 @@ func (h *HealthCheck) HandleUpdate(ctx context.Context, update Update) error {
 	if update.Message == nil {
 		return nil
 	}
-	command, argument := parseCommand(update.Message.Text)
+	command, addressee, addressed, argument := parseCommand(update.Message.Text)
+	if addressed && !strings.EqualFold(addressee, h.username) {
+		return nil
+	}
 	var reply string
 	switch command {
 	case "/ping":
@@ -40,10 +46,10 @@ func (h *HealthCheck) HandleUpdate(ctx context.Context, update Update) error {
 	return h.sender.SendMessage(ctx, update.Message.Chat.ID, reply, ParseMode)
 }
 
-// parseCommand splits a message into its command, without any "@botname" suffix, and the trimmed
-// text after it.
-func parseCommand(text string) (command, argument string) {
+// parseCommand splits a message into its command, the bot it is addressed to by an "@botname"
+// suffix, whether it has such a suffix, and the trimmed text after it.
+func parseCommand(text string) (command, addressee string, addressed bool, argument string) {
 	command, argument, _ = strings.Cut(strings.TrimSpace(text), " ")
-	command, _, _ = strings.Cut(command, "@")
-	return command, strings.TrimSpace(argument)
+	command, addressee, addressed = strings.Cut(command, "@")
+	return command, addressee, addressed, strings.TrimSpace(argument)
 }
