@@ -105,6 +105,61 @@ func TestNightPreferences(t *testing.T) {
 		}
 	})
 
+	t.Run("applies each member's away nights only to that member on those nights", func(t *testing.T) {
+		service := household.NewService(newTestDatabase(t))
+		created, member := newHouseholdWithMember(t, service)
+		sharedHard := addPreference(t, service, created.ID, "", sql.NullInt16{}, "peanuts", household.Allergy, household.Hard)
+		founderHard := addPreference(t, service, created.ID, created.CreatorID, sql.NullInt16{}, "vegetarian", household.DietaryRestriction, household.Hard)
+		founderSoft := addPreference(t, service, created.ID, created.CreatorID, sql.NullInt16{Int16: 4, Valid: true}, "spicy", household.Cuisine, household.Soft)
+		memberHard := addPreference(t, service, created.ID, member.ID, sql.NullInt16{}, "shellfish", household.Allergy, household.Hard)
+		memberSoft := addPreference(t, service, created.ID, member.ID, sql.NullInt16{Int16: 2, Valid: true}, "Italian", household.Cuisine, household.Soft)
+		if err := service.RecordAwayNights(context.Background(), created.ID, created.CreatorID, "2026-10-06"); err != nil {
+			t.Fatalf("record founder away night: %v", err)
+		}
+		if err := service.RecordAwayNights(context.Background(), created.ID, member.ID, "2026-10-08"); err != nil {
+			t.Fatalf("record member away night: %v", err)
+		}
+
+		for _, test := range []struct {
+			night    string
+			wantHard []household.Preference
+			wantSoft []household.WeightedPreference
+		}{
+			{
+				night:    "2026-10-06",
+				wantHard: []household.Preference{sharedHard, memberHard},
+				wantSoft: []household.WeightedPreference{
+					{Preference: founderSoft, Weight: 4 * household.AwaySoftPreferenceFactor},
+					{Preference: memberSoft, Weight: 2},
+				},
+			},
+			{
+				night:    "2026-10-07",
+				wantHard: []household.Preference{sharedHard, founderHard, memberHard},
+				wantSoft: []household.WeightedPreference{
+					{Preference: founderSoft, Weight: 4},
+					{Preference: memberSoft, Weight: 2},
+				},
+			},
+			{
+				night:    "2026-10-08",
+				wantHard: []household.Preference{sharedHard, founderHard},
+				wantSoft: []household.WeightedPreference{
+					{Preference: founderSoft, Weight: 4},
+					{Preference: memberSoft, Weight: 2 * household.AwaySoftPreferenceFactor},
+				},
+			},
+		} {
+			got := nightPreferences(t, service, created.ID, test.night)
+			if !reflect.DeepEqual(sortedHard(got.HardConstraints), sortedHard(test.wantHard)) {
+				t.Errorf("%s hard constraints: got %+v, want %+v", test.night, got.HardConstraints, test.wantHard)
+			}
+			if !reflect.DeepEqual(sortedSoft(got.SoftPreferences), sortedSoft(test.wantSoft)) {
+				t.Errorf("%s soft preferences: got %+v, want %+v", test.night, got.SoftPreferences, test.wantSoft)
+			}
+		}
+	})
+
 	t.Run("reflects attendance changed after the initial draft", func(t *testing.T) {
 		service := household.NewService(newTestDatabase(t))
 		created, member := newHouseholdWithMember(t, service)
