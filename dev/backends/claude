@@ -113,6 +113,12 @@ review() {
   findings="$(jq 'length' "$output_file")" ||
     die "ultrareview --json output was not valid JSON: $(cat "$output_file")"
   cat "$output_file"
+  # Findings for dev/devloop's next fix round (see "Backend contract" in
+  # docs/devloop-workflow.md). Only written when there are findings, never on a backend
+  # failure above, so the orchestrator can tell the two apart.
+  if [[ "$findings" -gt 0 && -n "${DEVLOOP_REVIEW_FEEDBACK_FILE:-}" ]]; then
+    jq . "$output_file" >"$DEVLOOP_REVIEW_FEEDBACK_FILE"
+  fi
   rm -f "$output_file" "$progress_file"
 
   if [[ "$findings" -eq 0 ]]; then
