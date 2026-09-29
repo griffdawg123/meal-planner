@@ -199,4 +199,51 @@ CREATE TABLE IF NOT EXISTS web_session (
         ON DELETE CASCADE
 );
 
+-- Telegram identities are linked by a member first issuing a one-time code
+-- from an authenticated interface and then sending it to the bot. These are
+-- new tables, so their rules are CHECK constraints rather than triggers.
+CREATE TABLE IF NOT EXISTS telegram_identity (
+    telegram_user_id INTEGER NOT NULL PRIMARY KEY
+                          CHECK (typeof(telegram_user_id) = 'integer' AND telegram_user_id > 0),
+    member_id        TEXT NOT NULL UNIQUE
+                          CHECK (member_id <> ''),
+    linked_at        INTEGER NOT NULL
+                          CHECK (typeof(linked_at) = 'integer'),
+
+    FOREIGN KEY (member_id)
+        REFERENCES member (id)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS telegram_link_code (
+    code_hash  BLOB NOT NULL PRIMARY KEY
+                    CHECK (typeof(code_hash) = 'blob' AND length(code_hash) = 32),
+    member_id  TEXT NOT NULL
+                    CHECK (member_id <> ''),
+    created_at INTEGER NOT NULL
+                    CHECK (typeof(created_at) = 'integer'),
+    expires_at INTEGER NOT NULL
+                    CHECK (typeof(expires_at) = 'integer' AND expires_at > created_at),
+    used_at    INTEGER
+                    CHECK (used_at IS NULL OR (
+                        typeof(used_at) = 'integer'
+                        AND used_at >= created_at
+                        AND used_at < expires_at
+                    )),
+
+    FOREIGN KEY (member_id)
+        REFERENCES member (id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS telegram_link_code_member
+    ON telegram_link_code (member_id);
+
+CREATE TRIGGER IF NOT EXISTS telegram_link_code_single_use
+BEFORE UPDATE OF used_at ON telegram_link_code
+WHEN OLD.used_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'telegram link code has already been used');
+END;
+
 COMMIT;

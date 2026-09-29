@@ -650,3 +650,299 @@ func insertAwayNight(t *testing.T, database *sql.DB, householdID, memberID, nigh
 		t.Fatalf("insert away night %s for %s: %v", night, memberID, err)
 	}
 }
+
+func TestTelegramIdentitySchema(t *testing.T) {
+	t.Run("links a telegram user to a member and resolves their household", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertTelegramIdentity(t, database, 123456789, "member-1")
+
+		var householdID, memberID string
+		if err := database.QueryRow(`
+			SELECT member.household_id, member.id
+			FROM telegram_identity
+			JOIN member ON member.id = telegram_identity.member_id
+			WHERE telegram_identity.telegram_user_id = ?
+		`, 123456789).Scan(&householdID, &memberID); err != nil {
+			t.Fatalf("resolve telegram identity: %v", err)
+		}
+		if householdID != "household-1" || memberID != "member-1" {
+			t.Fatalf("resolved identity: got (%q, %q), want (%q, %q)", householdID, memberID, "household-1", "member-1")
+		}
+	})
+
+	t.Run("an unlinked telegram user resolves to no member", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertTelegramIdentity(t, database, 123456789, "member-1")
+
+		var memberID string
+		err := database.QueryRow(
+			`SELECT member_id FROM telegram_identity WHERE telegram_user_id = ?`, 987654321,
+		).Scan(&memberID)
+		if err != sql.ErrNoRows {
+			t.Fatalf("resolve unlinked telegram user: got %v, want %v", err, sql.ErrNoRows)
+		}
+	})
+
+	t.Run("rejects linking one telegram user to two members", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertHousehold(t, database, "household-2", "member-2")
+		insertTelegramIdentity(t, database, 123456789, "member-1")
+
+		if err := execTelegramIdentity(database, 123456789, "member-2", 100); err == nil {
+			t.Fatal("insert telegram user linked to a second member: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects linking two telegram users to one member", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertTelegramIdentity(t, database, 123456789, "member-1")
+
+		if err := execTelegramIdentity(database, 987654321, "member-1", 100); err == nil {
+			t.Fatal("insert second telegram user for one member: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects a link for an unknown member", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		if err := execTelegramIdentity(database, 123456789, "missing-member", 100); err == nil {
+			t.Fatal("insert telegram identity for an unknown member: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects telegram user ids that are not positive integers", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		for _, userID := range []any{nil, 0, -5, 12.5, "alice"} {
+			if err := execTelegramIdentity(database, userID, "member-1", 100); err == nil {
+				t.Errorf("insert telegram_user_id=%v: got nil error, want error", userID)
+			}
+		}
+	})
+
+	t.Run("rejects a link time that is not an integer", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		for _, linkedAt := range []any{nil, "now", 100.5} {
+			if err := execTelegramIdentity(database, 123456789, "member-1", linkedAt); err == nil {
+				t.Errorf("insert linked_at=%v: got nil error, want error", linkedAt)
+			}
+		}
+	})
+
+	t.Run("deleting a member cascades to its telegram identity", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertSecondMember(t, database, "household-1", "member-2")
+		insertTelegramIdentity(t, database, 123456789, "member-2")
+
+		if _, err := database.Exec(`DELETE FROM member WHERE id = ?`, "member-2"); err != nil {
+			t.Fatalf("delete member: %v", err)
+		}
+
+		assertRowCount(t, database, "telegram_identity", 0)
+	})
+}
+
+func TestTelegramLinkCodeSchema(t *testing.T) {
+	t.Run("stores an unused code for a member", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		insertTelegramLinkCode(t, database, tokenHash(1), "member-1", 100, 200)
+	})
+
+	t.Run("rejects a code for an unknown member", func(t *testing.T) {
+		database := newTestDatabase(t)
+
+		if err := execTelegramLinkCode(database, tokenHash(1), "missing-member", 100, 200); err == nil {
+			t.Fatal("insert link code for an unknown member: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects a code hash that is not a SHA-256 digest", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		for _, hash := range []any{nil, []byte("ABCD-1234"), strings.Repeat("a", 32)} {
+			if err := execTelegramLinkCode(database, hash, "member-1", 100, 200); err == nil {
+				t.Errorf("insert code_hash=%v: got nil error, want error", hash)
+			}
+		}
+	})
+
+	t.Run("rejects a code that expires before it is created", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		if err := execTelegramLinkCode(database, tokenHash(1), "member-1", 200, 200); err == nil {
+			t.Fatal("insert expires_at equal to created_at: got nil error, want error")
+		}
+	})
+
+	t.Run("rejects timestamps that are not integers", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+
+		for _, values := range [][2]any{
+			{"never", 200},
+			{100, "never"},
+			{100, 200.5},
+		} {
+			if err := execTelegramLinkCode(database, tokenHash(1), "member-1", values[0], values[1]); err == nil {
+				t.Errorf("insert created_at=%v expires_at=%v: got nil error, want error", values[0], values[1])
+			}
+		}
+
+		insertTelegramLinkCode(t, database, tokenHash(2), "member-1", 100, 200)
+		for _, statement := range []string{
+			`UPDATE telegram_link_code SET used_at = 'never'`,
+			`UPDATE telegram_link_code SET used_at = 150.5`,
+		} {
+			if _, err := database.Exec(statement); err == nil {
+				t.Errorf("%s: got nil error, want error", statement)
+			}
+		}
+	})
+
+	t.Run("allows consuming a code within its lifetime", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertTelegramLinkCode(t, database, tokenHash(1), "member-1", 100, 200)
+
+		if _, err := database.Exec(`UPDATE telegram_link_code SET used_at = 150`); err != nil {
+			t.Fatalf("consume link code: got %v, want nil", err)
+		}
+	})
+
+	t.Run("rejects consuming a code outside its lifetime", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertTelegramLinkCode(t, database, tokenHash(1), "member-1", 100, 200)
+
+		for _, usedAt := range []int64{99, 200, 201} {
+			if _, err := database.Exec(`UPDATE telegram_link_code SET used_at = ?`, usedAt); err == nil {
+				t.Errorf("consume at %d: got nil error, want error", usedAt)
+			}
+		}
+	})
+
+	t.Run("rejects clearing or changing the use of a consumed code", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertTelegramLinkCode(t, database, tokenHash(1), "member-1", 100, 200)
+		if _, err := database.Exec(`UPDATE telegram_link_code SET used_at = 150`); err != nil {
+			t.Fatalf("consume link code: %v", err)
+		}
+
+		for _, statement := range []string{
+			`UPDATE telegram_link_code SET used_at = NULL`,
+			`UPDATE telegram_link_code SET used_at = 160`,
+		} {
+			if _, err := database.Exec(statement); err == nil {
+				t.Errorf("%s: got nil error, want error", statement)
+			}
+		}
+
+		var usedAt int64
+		if err := database.QueryRow(`SELECT used_at FROM telegram_link_code`).Scan(&usedAt); err != nil {
+			t.Fatalf("read used_at: %v", err)
+		}
+		if usedAt != 150 {
+			t.Errorf("used_at after rejected updates: got %d, want 150", usedAt)
+		}
+	})
+
+	t.Run("deleting a member cascades to its link codes", func(t *testing.T) {
+		database := newTestDatabase(t)
+		insertHousehold(t, database, "household-1", "member-1")
+		insertSecondMember(t, database, "household-1", "member-2")
+		insertTelegramLinkCode(t, database, tokenHash(1), "member-2", 100, 200)
+
+		if _, err := database.Exec(`DELETE FROM member WHERE id = ?`, "member-2"); err != nil {
+			t.Fatalf("delete member: %v", err)
+		}
+
+		assertRowCount(t, database, "telegram_link_code", 0)
+	})
+}
+
+func TestApplySchemaAddsTelegramTablesToExistingDatabase(t *testing.T) {
+	legacySchema, err := os.ReadFile("testdata/schema_before_magic_link_lifecycle.sql")
+	if err != nil {
+		t.Fatalf("read legacy schema: %v", err)
+	}
+	database := openTestDatabase(t)
+	if _, err := database.Exec(string(legacySchema)); err != nil {
+		t.Fatalf("apply legacy schema: %v", err)
+	}
+	insertHousehold(t, database, "household-1", "member-1")
+
+	if err := mealdb.ApplySchema(context.Background(), database); err != nil {
+		t.Fatalf("upgrade schema: %v", err)
+	}
+
+	insertTelegramLinkCode(t, database, tokenHash(1), "member-1", 100, 200)
+	insertTelegramIdentity(t, database, 123456789, "member-1")
+}
+
+func insertSecondMember(t *testing.T, database *sql.DB, householdID, memberID string) {
+	t.Helper()
+
+	if _, err := database.Exec(
+		`INSERT INTO member (id, household_id, name) VALUES (?, ?, ?)`,
+		memberID, householdID, "Second Member",
+	); err != nil {
+		t.Fatalf("insert member %s: %v", memberID, err)
+	}
+}
+
+func assertRowCount(t *testing.T, database *sql.DB, table string, want int) {
+	t.Helper()
+
+	var got int
+	if err := database.QueryRow(`SELECT count(*) FROM ` + table).Scan(&got); err != nil {
+		t.Fatalf("count %s rows: %v", table, err)
+	}
+	if got != want {
+		t.Errorf("%s rows: got %d, want %d", table, got, want)
+	}
+}
+
+func insertTelegramIdentity(t *testing.T, database *sql.DB, telegramUserID int64, memberID string) {
+	t.Helper()
+
+	if err := execTelegramIdentity(database, telegramUserID, memberID, 100); err != nil {
+		t.Fatalf("insert telegram identity: %v", err)
+	}
+}
+
+func execTelegramIdentity(database *sql.DB, telegramUserID any, memberID string, linkedAt any) error {
+	_, err := database.Exec(
+		`INSERT INTO telegram_identity (telegram_user_id, member_id, linked_at) VALUES (?, ?, ?)`,
+		telegramUserID, memberID, linkedAt,
+	)
+	return err
+}
+
+func insertTelegramLinkCode(t *testing.T, database *sql.DB, hash []byte, memberID string, createdAt, expiresAt int64) {
+	t.Helper()
+
+	if err := execTelegramLinkCode(database, hash, memberID, createdAt, expiresAt); err != nil {
+		t.Fatalf("insert telegram link code: %v", err)
+	}
+}
+
+func execTelegramLinkCode(database *sql.DB, hash any, memberID string, createdAt, expiresAt any) error {
+	_, err := database.Exec(
+		`INSERT INTO telegram_link_code (code_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		hash, memberID, createdAt, expiresAt,
+	)
+	return err
+}
