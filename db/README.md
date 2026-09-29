@@ -64,7 +64,8 @@ attending members cheap to compute.
   of a planning period.
 
 The table only records attendance. How planning weights an away member's soft preferences, and
-the rule that hard constraints of present members still apply, belong to the planning logic.
+the rule that hard constraints of present members still apply, belong to the planning logic
+(`household.Service.NightPreferences`).
 Recurring "regular nights out" are deferred; when added they can expand into or sit alongside
 these dated rows.
 
