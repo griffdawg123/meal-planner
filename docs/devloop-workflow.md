@@ -64,12 +64,54 @@ dev/devloop run --once    # do a single issue and stop
    `devloop:no-changes-needed`, comments why, and **closes it directly** —
    this doesn't stop the loop, it moves on to the next issue.
 6. Otherwise commits, pushes the branch, opens the PR with `Closes #<n>`.
-7. Dispatches the reviewer backend against the PR. A non-zero exit (findings
-   reported) does the same needs-attention-and-stop as step 4.
+7. Dispatches the reviewer backend against the PR. If it requests changes,
+   runs a **fix round** (see below) and reviews again, up to
+   `devloop.maxFixRounds` times (default 2). Still requesting changes after
+   that — or a reviewer that fails without leaving any findings — does the
+   same needs-attention-and-stop as step 4.
 8. If every PR check is green too (`gh pr checks --watch`, not `--required` —
    `main` isn't branch-protected yet, and `--required` would silently see
    zero required checks and pass trivially), merges (`--squash
    --delete-branch`), removes the worktree, and moves to the next issue.
+
+## Fix rounds
+
+When the reviewer requests changes, its findings go back to the implementer
+instead of stopping the loop straight away:
+
+1. The reviewer backend writes its findings to `$DEVLOOP_REVIEW_FEEDBACK_FILE`
+   (kept at `$(git rev-parse --git-path
+   devloop-state)/review-<issue>-round-<n>.md`).
+2. `dev/devloop` builds a fix prompt: the original task prompt (issue, parent
+   story, house rules) plus those findings quoted verbatim, and runs the
+   implementer backend on the **same** worktree.
+3. The same local checks as step 4 run again (gofmt, `go vet`, tests).
+4. The change is committed as `Address review feedback on #<n> (round <k>)`
+   and pushed to the existing PR branch — same PR, no new one.
+5. The reviewer reviews the whole PR again.
+
+It stops with `devloop:needs-attention` (and a notification) when:
+
+- the reviewer still requests changes after `devloop.maxFixRounds` rounds,
+- the implementer makes no changes in response to the feedback (usually it
+  disagreed with a finding — its summary in the run output says why, and a
+  human has to decide),
+- any check fails in a fix round, exactly as for the first implementation.
+
+The round number is part of the resume state, so a usage-limit pause in the
+middle of a fix round resumes that round rather than starting over. Set
+`git config --local devloop.maxFixRounds 0` to get the old behaviour back:
+stop on the first changes-requested review.
+
+The auto-merge gate is unchanged: a PR only merges once an independent
+reviewer passes and CI is green. A fix round just gives the implementer a
+chance to get there.
+
+**amp as implementer can't do fix rounds yet.** `dev/orb start` requires
+`HEAD` to exactly match `origin/main`, which stops being true once the
+first commit is on the issue branch, so a fix round with the `amp`
+implementer fails and stops with needs-attention. The `claude` implementer
+is fine.
 
 ## Usage-limit pausing
 
@@ -90,6 +132,29 @@ The usage-limit detection is a text heuristic (`dev/backends/claude`'s
 `USAGE_LIMIT_PATTERN`) that hasn't been confirmed against a real occurrence
 yet — tighten it the first time a run pauses unexpectedly or fails to pause
 when it should have.
+
+## Push notifications
+
+Every stop condition — `devloop:needs-attention`, a pause, or the backlog
+running dry — prints to stderr and, if configured, also sends a push
+notification via [ntfy](https://ntfy.sh). This matters most for `dev/devloop
+run` (continuous mode) or anything unattended: without it, the *only* signal
+that the loop stopped is the GitHub label/comment, or noticing the process
+died.
+
+It's opt-in and off by default. Set your own topic yourself — a topic on the
+public `ntfy.sh` instance is unauthenticated, so anyone who knows it can read
+(or publish to) it, and there's no reason to tell anyone else, including an
+agent, what it is:
+
+```bash
+git config --local devloop.ntfyTopic '<your-topic>'
+git config --local devloop.ntfyServer 'https://ntfy.sh'   # optional; this is the default
+```
+
+`dev/devloop doctor` reports whether notifications are enabled (and warns if
+`curl` isn't installed). A notification failure never affects the loop's own
+exit code — `notify()` always swallows its own errors.
 
 ## Self-improving AGENTS.md
 
@@ -115,9 +180,17 @@ A backend is any executable at `dev/backends/<name>` implementing:
 - `review <pr-number> <issue-number>` — read the PR diff and the issue
   (`gh`), post findings to the PR, and signal verdict via exit code (0 =
   pass, 1 = changes requested, 75 = paused). Must not modify the worktree.
+  On changes requested it must also write the findings to
+  `$DEVLOOP_REVIEW_FEEDBACK_FILE` for the next fix round, specific enough to
+  act on without extra context. Write that file **only** on a real
+  changes-requested verdict, never when the backend itself fails: an exit 1
+  with no feedback file is how the orchestrator tells a broken reviewer from
+  one that asked for changes.
 
 `dev/devloop` sets `DEVLOOP_STATE_DIR` in the environment before invoking
-either subcommand.
+either subcommand, and `DEVLOOP_REVIEW_FEEDBACK_FILE` before `review`. A fix
+round is just another `implement` call, on the existing worktree with a fix
+prompt, so an implementer backend needs nothing extra to support it.
 
 ### The amp backend
 

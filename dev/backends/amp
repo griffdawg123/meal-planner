@@ -37,6 +37,10 @@ mark_paused() {
   [[ -n "${DEVLOOP_STATE_DIR:-}" ]] || die "DEVLOOP_STATE_DIR must be set by the orchestrator"
   mkdir -p "$DEVLOOP_STATE_DIR"
   printf '%s: %s\n' "$(date -u +%FT%TZ)" "$detail" >"$DEVLOOP_STATE_DIR/paused"
+  # Print at the moment it happens, not just next time doctor is checked — in continuous
+  # `dev/devloop run` mode this is otherwise the one stop condition that exits with no
+  # visible explanation at all.
+  printf 'paused: %s\n' "$detail" >&2
 }
 
 # NOTE: like the claude backend's usage-limit pattern, this hasn't been confirmed against a
@@ -138,6 +142,13 @@ $issue_body
 $diff
 \`\`\`
 
+Refer to code by repository-relative path and line (e.g. db/schema.sql:92),
+never by absolute path or file:// link — this review is posted to GitHub.
+
+If you request changes, make each finding specific enough to act on without
+further context: what is wrong, where, and how to reproduce it. dev/devloop
+hands your findings to an implementer agent to fix automatically.
+
 End your response with exactly one line, verbatim, and nothing after it:
 DEVLOOP_VERDICT: PASS
 or
@@ -164,9 +175,14 @@ EOF
 
   if printf '%s' "$output" | grep -q 'DEVLOOP_VERDICT: *PASS'; then
     exit 0
-  else
-    exit 1
   fi
+  # Findings for dev/devloop's next fix round (see "Backend contract" in
+  # docs/devloop-workflow.md). Only written on a real changes-requested verdict, never on a
+  # backend failure above, so the orchestrator can tell the two apart.
+  if [[ -n "${DEVLOOP_REVIEW_FEEDBACK_FILE:-}" ]]; then
+    printf '%s\n' "$output" >"$DEVLOOP_REVIEW_FEEDBACK_FILE"
+  fi
+  exit 1
 }
 
 main() {

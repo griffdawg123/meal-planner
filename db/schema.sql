@@ -76,6 +76,28 @@ CREATE TABLE IF NOT EXISTS preference (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS away_night (
+    household_id TEXT NOT NULL
+                      CHECK (household_id <> ''),
+    member_id    TEXT NOT NULL
+                      CHECK (member_id <> ''),
+    night        TEXT NOT NULL
+                      CHECK (typeof(night) = 'text' AND night IS date(night)),
+    created_at   TEXT NOT NULL
+                      DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+
+    PRIMARY KEY (member_id, night),
+    FOREIGN KEY (household_id)
+        REFERENCES household (id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (household_id, member_id)
+        REFERENCES member (household_id, id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS away_night_household_night
+    ON away_night (household_id, night);
+
 CREATE TABLE IF NOT EXISTS web_identity (
     email      TEXT PRIMARY KEY
                     CHECK (email = lower(trim(email)) AND email <> ''),

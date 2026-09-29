@@ -24,6 +24,10 @@ mark_paused() {
   [[ -n "${DEVLOOP_STATE_DIR:-}" ]] || die "DEVLOOP_STATE_DIR must be set by the orchestrator"
   mkdir -p "$DEVLOOP_STATE_DIR"
   printf '%s: %s\n' "$(date -u +%FT%TZ)" "$detail" >"$DEVLOOP_STATE_DIR/paused"
+  # Print at the moment it happens, not just next time doctor is checked — in continuous
+  # `dev/devloop run` mode this is otherwise the one stop condition that exits with no
+  # visible explanation at all.
+  printf 'paused: %s\n' "$detail" >&2
 }
 
 # NOTE: the exact wording Claude Code uses when a subscription's daily usage
@@ -109,6 +113,12 @@ review() {
   findings="$(jq 'length' "$output_file")" ||
     die "ultrareview --json output was not valid JSON: $(cat "$output_file")"
   cat "$output_file"
+  # Findings for dev/devloop's next fix round (see "Backend contract" in
+  # docs/devloop-workflow.md). Only written when there are findings, never on a backend
+  # failure above, so the orchestrator can tell the two apart.
+  if [[ "$findings" -gt 0 && -n "${DEVLOOP_REVIEW_FEEDBACK_FILE:-}" ]]; then
+    jq . "$output_file" >"$DEVLOOP_REVIEW_FEEDBACK_FILE"
+  fi
   rm -f "$output_file" "$progress_file"
 
   if [[ "$findings" -eq 0 ]]; then
