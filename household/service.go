@@ -25,6 +25,12 @@ var (
 	ErrFoundingMember = errors.New("founding household member cannot be removed")
 	// ErrPreferenceNotFound identifies an operation on a preference that does not exist in the household.
 	ErrPreferenceNotFound = errors.New("household preference not found")
+	// ErrPermissionDenied identifies an action the acting member is not allowed to perform, such as
+	// changing another household's data. Nothing is changed.
+	ErrPermissionDenied = errors.New("household permission denied")
+	// ErrHardConstraint identifies a change rejected because it would break a hard constraint, such
+	// as an allergy or diet. Nothing is changed.
+	ErrHardConstraint = errors.New("blocked by household hard constraint")
 )
 
 // Service provides household operations backed by a database.
